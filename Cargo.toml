@@ -1,0 +1,14 @@
+[package]
+name = "poc-v3-lp-chaser"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+ethers = { version = "2.0", features = ["ws", "openssl"] }
+eyre = "0.6"
+serde = { version = "1.0.197", features = ["derive"] }
+serde_json = { version = "1.0.114" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+uniswap-v3-sdk = { version = "0.27.0", features = ["extensions"] }
