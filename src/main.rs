@@ -1,16 +1,18 @@
 use std::env;
 use std::fs::File;
 use std::io::Read;
+use std::sync::Arc;
 use std::time::Duration;
 use serde::{Deserialize};
-//use uniswap_v3_sdk::{UniswapV3Position, Token, Pair};
 use ethers::prelude::*;
 
-#[derive(Debug, Deserialize)]
+
+#[derive(Debug, Deserialize, Clone)]
 struct Config {
     uni_v3_pool_address: String,
     wallet_address: String,
     ethers_provider_url: String,
+    uniswap_nfpm_address: String,
 }
 
 fn read_config(config_file_path: &str) -> Result<Config, Box<dyn std::error::Error>> {
@@ -19,6 +21,25 @@ fn read_config(config_file_path: &str) -> Result<Config, Box<dyn std::error::Err
     file.read_to_string(&mut contents)?;
     let config: Config = serde_json::from_str(&contents)?;
     Ok(config)
+}
+
+async fn fetch_lp_position(provider: Provider<Http>, config: Config) -> Result<(), Box<dyn std::error::Error>> {
+    abigen!(
+        NFPM,
+        "./src/abis/NonfungiblePositionManager.json",
+    );
+    let nfpm_address = config.uniswap_nfpm_address.parse::<Address>()?;
+    let client = Arc::new(provider);
+    let uniswap_nfpm = NFPM::new(
+        nfpm_address,
+        client.clone()
+    );
+
+    // call the contract method to fetch the LP position
+    let lp_position = uniswap_nfpm.positions(3628.into()).call().await?;
+    println!("LP Position: {:?}", lp_position);
+    
+    Ok(())
 }
 
 #[tokio::main]
@@ -35,9 +56,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = read_config(config_file_path)?;
 
     // Set up ethers provider
-    let provider = Provider::<Http>::try_from(config.ethers_provider_url)?;
+    let provider = Provider::<Http>::try_from(config.ethers_provider_url.clone())?;
     let block_number = provider.get_block_number().await?;
     println!("{block_number}");
+
+    // get current LP position based on ID from config file
+    let lp_position = fetch_lp_position(provider.clone(), config.clone()).await?;
+
+    //println!("{lp_position}");
 
     Ok(())
 }
