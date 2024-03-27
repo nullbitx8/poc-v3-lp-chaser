@@ -2,24 +2,42 @@ use std::env;
 use std::fs::File;
 use std::io::Read;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use serde::{Deserialize};
-use ethers::prelude::*;
+use ethers::prelude::{abigen, Http, LocalWallet, Provider, SignerMiddleware};
+use ethers::middleware::{Middleware, MiddlewareBuilder};
+use ethers::types::{Address as EthersAddress, TransactionRequest, U256};
+use alloy_primitives::{Address as AlloyAddress, Uint};
+use uniswap_sdk_core::prelude::{Address, Currency, CurrencyAmount};
+use uniswap_sdk_core::entities::token::{Token};
+use uniswap_sdk_core::token;
+use uniswap_sdk_core::entities::fractions::percent::Percent;
+use uniswap_v3_sdk::utils::{u256_to_big_int};
+use uniswap_v3_sdk::entities::{Pool, Position};
+use uniswap_v3_sdk::extensions::{get_collectable_token_amounts, get_position};
+use uniswap_v3_sdk::nonfungible_position_manager::{
+    CollectOptions,
+    remove_call_parameters,
+    RemoveLiquidityOptions
+};
 
 
 #[derive(Debug, Deserialize, Clone)]
 struct Config {
     uni_v3_pool_address: String,
     wallet_address: String,
+    wallet_private_key: String,
     ethers_provider_url: String,
     uniswap_nfpm_address: String,
     my_lp_position_id: usize,
+    range_percentage: f32,
+    chain_id: u64
 }
 
 #[derive(Debug, Clone)]
-struct Position {
-    token_0: Address,
-    token_1: Address,
+struct MyPosition {
+    token_0: EthersAddress,
+    token_1: EthersAddress,
     fee: u32,
     tick_lower: i32,
     tick_upper: i32,
@@ -36,16 +54,121 @@ fn read_config(config_file_path: &str) -> Result<Config, Box<dyn std::error::Err
     Ok(config)
 }
 
+/*
+async fn get_provider(
+    config: Config
+) -> Result<Arc<Provider<Http>>, Box<dyn std::error::Error>> {
+    let signer = config.wallet_private_key.as_str().parse::<LocalWallet>()?;
+
+    let provider = Arc::new({
+        Provider::<Http>::try_from(
+            config.ethers_provider_url,
+        )?.with_signer(signer)
+    });
+
+    Ok(provider)
+}
+*/
+
+async fn fetch_token(
+    provider: Provider<Http>,
+    address: String,
+    chain_id: u64
+) -> Result<Token, Box<dyn std::error::Error>> {
+    let client = Arc::new(provider);
+
+    let h160_address = address.clone().parse::<EthersAddress>()?;
+    abigen!(
+        IERC20,
+        "./src/abis/IERC20.json",
+    );
+    let token_contract = IERC20::new(
+        h160_address,
+        client
+    );
+
+    let decimals = token_contract.decimals().call().await?;
+    let symbol = token_contract.symbol().call().await?;
+    let name = token_contract.name().call().await?;
+
+    let token = token!(
+        chain_id,
+        address.clone(),
+        decimals,
+        symbol,
+        name
+    );
+
+    Ok(token)
+}
+
+
+/*
+async fn fetch_pool(
+    provider: Provider<Http>,
+    address: String,
+    chain_id: u32
+) -> Result<Pool, Box<dyn std::error::Error>> {
+    let client = Arc::new(provider.clone());
+    let address = address.parse::<Address>()?;
+
+    abigen!(
+        UniswapV3Pool,
+        "./src/abis/UniswapV3Pool.json",
+    );
+    let v3_pool = UniswapV3Pool::new(
+        address.clone(),
+        client
+    );
+
+    let token0 = v3_pool.token_0().call().await?;
+    let token0 = fetch_token(
+        provider.clone(),
+        token0.clone().to_string(),
+        chain_id
+    ).await?;
+
+    let token1 = v3_pool.token_1().call().await?;
+    let token1 = fetch_token(
+        provider.clone(),
+        token1.clone().to_string(),
+        chain_id
+    ).await?;
+
+    let slot0 = v3_pool.slot_0().call().await?;
+    let fee_amount = v3_pool.fee().call().await?;
+    let liquidity = v3_pool.liquidity().call().await?;
+
+    Pool::new(
+        token0,
+        token1,
+        fee_amount.into(),
+        slot0.0,  // sqrt ratio
+        liquidity,
+    )
+}
+*/
+
+/*
 async fn fetch_lp_position(
     provider: Provider<Http>,
     config: Config
 ) -> Result<Position, Box<dyn std::error::Error>> {
+    // fetch the pool
+    let pool = fetch_pool(
+        provider.clone(),
+        config.uni_v3_pool_address,
+        config.chain_id
+    );
+
+    // fetch our position
+    let client = Arc::new(provider);
+
     abigen!(
         NFPM,
         "./src/abis/NonfungiblePositionManager.json",
     );
     let nfpm_address = config.uniswap_nfpm_address.parse::<Address>()?;
-    let client = Arc::new(provider);
     let uniswap_nfpm = NFPM::new(
         nfpm_address,
         client.clone()
@@ -55,21 +178,15 @@ async fn fetch_lp_position(
     let lp_position = uniswap_nfpm.positions(
         config.my_lp_position_id.into()
     ).call().await?;
-    println!("LP Position: {:?}", lp_position);
-    
-    Ok(
-        Position {
-            token_0: lp_position.2,
-            token_1: lp_position.3,
-            fee: lp_position.4,
-            tick_lower: lp_position.5,
-            tick_upper: lp_position.6,
-            liquidity: lp_position.7,
-            tokens_owed_0: lp_position.10,
-            tokens_owed_1: lp_position.11
-        }
+
+    Position::new(
+        pool.clone(),
+        lp_position.7,  // liquidity
+        lp_position.5,  // tick lower
+        lp_position.6   // tick upper
     )
 }
+*/
 
 async fn fetch_twap_tick(
     provider: Provider<Http>,
@@ -81,7 +198,7 @@ async fn fetch_twap_tick(
         UniswapV3Pool,
         "./src/abis/UniswapV3Pool.json",
     );
-    let uni_v3_pool_address = config.uni_v3_pool_address.parse::<Address>()?;
+    let uni_v3_pool_address = config.uni_v3_pool_address.parse::<EthersAddress>()?;
     println!("got uni_v3_pool_address: {:?}", uni_v3_pool_address);
     let client = Arc::new(provider);
     let v3_pool = UniswapV3Pool::new(
@@ -118,7 +235,7 @@ async fn fetch_current_tick(
         UniswapV3Pool,
         "./src/abis/UniswapV3Pool.json",
     );
-    let uni_v3_pool_address = config.uni_v3_pool_address.parse::<Address>()?;
+    let uni_v3_pool_address = config.uni_v3_pool_address.parse::<EthersAddress>()?;
     let client = Arc::new(provider);
     let v3_pool = UniswapV3Pool::new(
         uni_v3_pool_address,
@@ -127,12 +244,131 @@ async fn fetch_current_tick(
 
     // call the contract method to fetch the current tick
     let slot_0 = v3_pool.slot_0().await?;
-    println!("got slot0 {:?}", slot_0);
     let current_tick = slot_0.1;
 
     Ok(current_tick)
 }
 
+fn calc_new_ticks(current_tick: i32, percentage: f32) -> (i32, i32) {
+    // calculate the upper and lower ticks by bounding them to a
+    // price change percentage
+    //
+    // 1 tick = 0.01% in price change
+    //
+    let tick_change = (percentage / 0.01 as f32).round() as i32;
+    let upper_tick = current_tick + tick_change;
+    let lower_tick = current_tick - tick_change;
+
+    (lower_tick, upper_tick)
+}
+
+fn convert_to_ethers_u256(alloy_u256: Uint<256, 4>) -> U256 {
+    let inner_value: [u8; 32] = alloy_u256.to_le_bytes(); // Convert to bytes in little-endian format
+    let mut bytes = [0; 32];
+    bytes.copy_from_slice(&inner_value); // Copy the bytes into a fixed-size array
+
+    // Create an ethers U256 from the bytes
+    U256::from(bytes)
+}
+
+async fn remove_liquidity_collect_fees(
+    provider: Provider<Http>,
+    config: Config,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("in remove_liquidity");
+
+    // get position using token id
+    let position = get_position(
+        config.chain_id,
+        config.uniswap_nfpm_address.parse::<AlloyAddress>()?,
+        config.my_lp_position_id.to_string().parse().unwrap(),
+        Arc::new(provider.clone()),
+        None
+    ).await?;
+
+    // get collectible fees amounts 
+    let collectible_token_amounts = get_collectable_token_amounts(
+        config.chain_id,
+        config.uniswap_nfpm_address.parse::<AlloyAddress>()?,
+        config.my_lp_position_id.to_string().parse().unwrap(),
+        Arc::new(provider.clone()),
+        None
+    ).await?;
+    let currency_owed0_amount = CurrencyAmount::from_raw_amount(
+        Currency::Token(position.pool.token0.clone()),
+        u256_to_big_int(collectible_token_amounts.0),
+    )?;
+    let currency_owed1_amount = CurrencyAmount::from_raw_amount(
+        Currency::Token(position.pool.token1.clone()),
+        u256_to_big_int(collectible_token_amounts.1),
+    )?;
+
+    // set deadline 2 minutes from now
+    let deadline = (
+        SystemTime::now() + Duration::from_secs(2 * 60)
+    ).duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+
+    // configure remove liquidity options
+    let options = RemoveLiquidityOptions {
+        token_id: config.my_lp_position_id.to_string().parse().unwrap(),
+        liquidity_percentage: Percent::new(100,100),
+        slippage_tolerance: Percent::new(1, 100),
+        deadline: deadline.to_string().parse().unwrap(),
+        burn_token: false,
+        permit: None,
+        collect_options: CollectOptions {
+            token_id: config.my_lp_position_id.to_string().parse().unwrap(),
+            expected_currency_owed0: currency_owed0_amount,
+            expected_currency_owed1: currency_owed1_amount,
+            recipient: config.wallet_address.parse().unwrap()
+        }
+    };
+
+    // prepare the input for nfpm remove liquidity method
+    let method_params = remove_call_parameters(
+        &position,
+        options
+    )?;
+    let value = convert_to_ethers_u256(method_params.value);
+
+    // prepare tx
+    let signer = config.wallet_private_key.as_str().parse::<LocalWallet>()?;
+    let client = provider.with_signer(signer);
+    let tx = TransactionRequest::new()
+        .to(config.uniswap_nfpm_address)
+        .value(value)
+        .data(method_params.calldata);
+
+    // send tx to mempool
+    let pending_tx = client.send_transaction(tx, None).await?;
+
+    // get the mined tx
+    let receipt = pending_tx.await?.ok_or_else(|| eyre::format_err!("tx dropped from mempool"))?;
+    let tx = client.get_transaction(receipt.transaction_hash).await?;
+
+    println!("Sent tx: {}\n", serde_json::to_string(&tx)?);
+    println!("Tx receipt: {}", serde_json::to_string(&receipt)?);
+
+
+    Ok(())
+}
+
+async fn adjust_lower<P>(
+    provider: Provider<Http>,
+    config: Config,
+    lp_position: Position<P>,
+    new_ticks: &(i32, i32)
+) -> Result<(), Box<dyn std::error::Error>> {
+    // undo the current LP position and collect fees
+    remove_liquidity_collect_fees(provider.clone(), config.clone()).await?;
+
+    // calculate amounts needed for new position
+    // sell tokens as needed
+    // create new position
+    // save new position ID to config file
+
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -148,21 +384,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = read_config(config_file_path)?;
 
     // Set up ethers provider
-    let provider = Provider::<Http>::try_from(config.ethers_provider_url.clone())?;
+    let provider = Provider::<Http>::try_from(
+        config.ethers_provider_url.clone(),
+    )?;
     let block_number = provider.get_block_number().await?;
     println!("{block_number}");
 
     loop {
         // get current LP position based on ID from config file
-        let lp_position = fetch_lp_position(provider.clone(), config.clone()).await?;
-        println!("{:?}", lp_position);
+        //let lp_position = fetch_lp_position(provider.clone(), config.clone()).await?;
+        let lp_position = get_position(
+            config.chain_id.clone(),
+            config.uniswap_nfpm_address.clone().parse::<AlloyAddress>()?,
+            config.my_lp_position_id.clone().to_string().parse().unwrap(),
+            Arc::new(provider.clone()),
+            None
+        ).await?;
+        println!("lp position: {:?}", lp_position);
 
         // get current price as a tick
         let current_tick = fetch_current_tick(provider.clone(), config.clone()).await?;
+        println!("current tick: {:?}", current_tick);
 
-        // check if current tick is outside position range
-        // if above range, handle buy logic
-        // if below range, handle sell logic
+        // calculate new upper and lower ticks
+        let new_ticks = calc_new_ticks(current_tick, config.range_percentage);
+
+        // check if current tick is outside of our position range
+        // and adjust the position as necessary
+        adjust_lower(
+            provider.clone(),
+            config.clone(),
+            lp_position.clone(),
+            &new_ticks
+        ).await?;
+        if current_tick < lp_position.tick_lower {
+            adjust_lower(
+                provider.clone(),
+                config.clone(),
+                lp_position.clone(),
+                &new_ticks
+            );
+        }
+        if current_tick > lp_position.tick_upper {
+            //adjust_higher(provider.clone(), lp_position.clone(), &new_ticks);
+        }
 
         // wait 5 minutes
         std::thread::sleep(Duration::from_secs(300));

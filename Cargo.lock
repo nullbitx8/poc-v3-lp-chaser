@@ -2431,11 +2431,13 @@ checksum = "d231b230927b5e4ad203db57bbcbee2802f6bce620b1e4a9024a07d94e2907ec"
 name = "poc-v3-lp-chaser"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
  "ethers",
  "eyre",
  "serde",
  "serde_json",
  "tokio",
+ "uniswap-sdk-core",
  "uniswap-v3-sdk",
 ]
 
