@@ -8,42 +8,46 @@ use ethers::prelude::{abigen, Http, LocalWallet, Provider, SignerMiddleware};
 use ethers::middleware::{Middleware, MiddlewareBuilder};
 use ethers::types::{Address as EthersAddress, TransactionRequest, U256};
 use alloy_primitives::{Address as AlloyAddress, Uint};
-use uniswap_sdk_core::prelude::{Address, Currency, CurrencyAmount};
-use uniswap_sdk_core::entities::token::{Token};
 use uniswap_sdk_core::token;
-use uniswap_sdk_core::entities::fractions::percent::Percent;
-use uniswap_v3_sdk::utils::{u256_to_big_int};
-use uniswap_v3_sdk::entities::{Pool, Position};
-use uniswap_v3_sdk::extensions::{get_collectable_token_amounts, get_position};
-use uniswap_v3_sdk::nonfungible_position_manager::{
+use uniswap_sdk_core::prelude::{
+    Address,
+    Currency,
+    CurrencyAmount,
+    Token,
+    Percent
+};
+use uniswap_v3_sdk::prelude::{
     CollectOptions,
+    FeeAmount,
+    get_collectable_token_amounts,
+    get_position,
+    get_pool,
+    get_sqrt_ratio_at_tick,
+    Pool,
+    Position,
+    nearest_usable_tick,
     remove_call_parameters,
-    RemoveLiquidityOptions
+    RemoveLiquidityOptions,
+    sqrt_ratio_x96_to_price,
+    u256_to_big_int,
 };
 
 
 #[derive(Debug, Deserialize, Clone)]
 struct Config {
+    my_lp_position_id: usize,
+    range_percentage: f32,
+    quote_token_size_in_usd: f32,
     uni_v3_pool_address: String,
+    weth_address: String,
+    usdc_address: String,
+    weth_usdc_pool_address: String,
+    uniswap_v3_factory_address: String,
+    uniswap_nfpm_address: String,
     wallet_address: String,
     wallet_private_key: String,
     ethers_provider_url: String,
-    uniswap_nfpm_address: String,
-    my_lp_position_id: usize,
-    range_percentage: f32,
     chain_id: u64
-}
-
-#[derive(Debug, Clone)]
-struct MyPosition {
-    token_0: EthersAddress,
-    token_1: EthersAddress,
-    fee: u32,
-    tick_lower: i32,
-    tick_upper: i32,
-    liquidity: u128,
-    tokens_owed_0: u128,
-    tokens_owed_1: u128
 }
 
 fn read_config(config_file_path: &str) -> Result<Config, Box<dyn std::error::Error>> {
@@ -70,6 +74,7 @@ async fn get_provider(
 }
 */
 
+/*
 async fn fetch_token(
     provider: Provider<Http>,
     address: String,
@@ -101,7 +106,7 @@ async fn fetch_token(
 
     Ok(token)
 }
-
+*/
 
 /*
 async fn fetch_pool(
@@ -249,6 +254,43 @@ async fn fetch_current_tick(
     Ok(current_tick)
 }
 
+async fn get_usdc_price_of_weth(
+    provider: Provider<Http>,
+    config: Config,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // get sqrtPriceX96 from pool
+    let pool = get_pool(
+        config.chain_id,
+        config.uniswap_v3_factory_address.parse::<AlloyAddress>()?,
+        config.weth_address.parse::<AlloyAddress>()?,
+        config.usdc_address.parse::<AlloyAddress>()?,
+        FeeAmount::MEDIUM,
+        Arc::new(provider.clone()),
+        None
+    ).await?;
+    let sqrt_price = pool.sqrt_ratio_x96;
+
+    // convert to price
+    let price = sqrt_ratio_x96_to_price(
+        sqrt_price,
+        pool.token0,
+        pool.token1
+    );
+    println!("price: {:?}", price);
+
+    // return amount including decimals
+    Ok(())
+}
+
+async fn get_size_in_weth(
+    amount_in_usdc: f32
+) -> Result<f32, Box<dyn std::error::Error>> {
+    // get current price of WETH based on pool
+    // TODO
+    
+    Ok(69.420)
+}
+
 fn calc_new_ticks(current_tick: i32, percentage: f32) -> (i32, i32) {
     // calculate the upper and lower ticks by bounding them to a
     // price change percentage
@@ -363,10 +405,44 @@ async fn adjust_lower<P>(
     remove_liquidity_collect_fees(provider.clone(), config.clone()).await?;
 
     // calculate amounts needed for new position
+    // get nearest usable ticks
+    let lower_tick = nearest_usable_tick(new_ticks.0, lp_position.pool.tick_spacing());
+    let upper_tick = nearest_usable_tick(new_ticks.1, lp_position.pool.tick_spacing());
+    
+    // get sqrt ratio at the ticks
+    let sqrt_ratio_lower = get_sqrt_ratio_at_tick(lower_tick);
+    let sqrt_ratio_upper = get_sqrt_ratio_at_tick(upper_tick);
+
+    // get amount of token0 to use
+    let token0_amount = 
+        if lp_position.pool.token0.address == config.weth_address.clone().parse::<AlloyAddress>()? || 
+            lp_position.pool.token1.address == config.weth_address.clone().parse::<AlloyAddress>()? {
+            get_size_in_weth(config.quote_token_size_in_usd.clone()).await?
+    } else if lp_position.pool.token0.address == config.usdc_address.clone().parse::<AlloyAddress>()? ||
+        lp_position.pool.token1.address == config.usdc_address.clone().parse::<AlloyAddress>()? {
+            config.quote_token_size_in_usd
+        }
+      else { panic!("Neither token0 nor token1 are weth or usdc"); };
+
+
+    // get liquidity using lower and upper ticks + amount of token0 to use
+    // use liquidity + lower and upper ticks to get amount of token1 needed 
+
     // sell tokens as needed
+
     // create new position
+
     // save new position ID to config file
 
+    Ok(())
+}
+
+async fn adjust_higher<P>(
+    provider: Provider<Http>,
+    config: Config,
+    lp_position: Position<P>,
+    new_ticks: &(i32, i32)
+) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
@@ -409,14 +485,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // calculate new upper and lower ticks
         let new_ticks = calc_new_ticks(current_tick, config.range_percentage);
 
+        get_usdc_price_of_weth(provider.clone(), config.clone()).await?;
+
         // check if current tick is outside of our position range
         // and adjust the position as necessary
-        adjust_lower(
-            provider.clone(),
-            config.clone(),
-            lp_position.clone(),
-            &new_ticks
-        ).await?;
         if current_tick < lp_position.tick_lower {
             adjust_lower(
                 provider.clone(),
@@ -426,7 +498,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         if current_tick > lp_position.tick_upper {
-            //adjust_higher(provider.clone(), lp_position.clone(), &new_ticks);
+            adjust_higher(
+                provider.clone(),
+                config.clone(),
+                lp_position.clone(),
+                &new_ticks
+            );
         }
 
         // wait 5 minutes
