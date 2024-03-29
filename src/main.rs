@@ -13,8 +13,10 @@ use uniswap_sdk_core::prelude::{
     Address,
     Currency,
     CurrencyAmount,
+    Percent,
+    Price,
+    Rounding,
     Token,
-    Percent
 };
 use uniswap_v3_sdk::prelude::{
     CollectOptions,
@@ -257,7 +259,7 @@ async fn fetch_current_tick(
 async fn get_usdc_price_of_weth(
     provider: Provider<Http>,
     config: Config,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<String, Box<dyn std::error::Error>> {
     // get sqrtPriceX96 from pool
     let pool = get_pool(
         config.chain_id,
@@ -268,27 +270,53 @@ async fn get_usdc_price_of_weth(
         Arc::new(provider.clone()),
         None
     ).await?;
-    let sqrt_price = pool.sqrt_ratio_x96;
 
     // convert to price
     let price = sqrt_ratio_x96_to_price(
-        sqrt_price,
+        pool.sqrt_ratio_x96,
         pool.token0,
-        pool.token1
-    );
-    println!("price: {:?}", price);
+        pool.token1.clone()
+    ).unwrap();
+    let fixed = price.to_fixed(4, Rounding::RoundHalfUp);
 
-    // return amount including decimals
-    Ok(())
+    Ok(fixed)
 }
 
 async fn get_size_in_weth(
-    amount_in_usdc: f32
-) -> Result<f32, Box<dyn std::error::Error>> {
-    // get current price of WETH based on pool
-    // TODO
-    
-    Ok(69.420)
+    provider: Provider<Http>,
+    config: Config,
+) -> Result<String, Box<dyn std::error::Error>> {
+    // get sqrtPriceX96 from pool
+    let pool = get_pool(
+        config.chain_id,
+        config.uniswap_v3_factory_address.parse::<AlloyAddress>()?,
+        config.weth_address.parse::<AlloyAddress>()?,
+        config.usdc_address.parse::<AlloyAddress>()?,
+        FeeAmount::MEDIUM,
+        Arc::new(provider.clone()),
+        None
+    ).await?;
+
+    // convert to price
+    let price = sqrt_ratio_x96_to_price(
+        pool.sqrt_ratio_x96,
+        pool.token0,
+        pool.token1.clone()
+    );
+    let price = price.unwrap();
+
+    // calculate amount of WETH needed based on config.quote_token_size_in_usd
+    let inverted = price.clone().invert();
+    let quote = inverted.quote(
+        CurrencyAmount::from_raw_amount(
+            price.quote_currency.clone(),
+            config.quote_token_size_in_usd.clone() as u32 * 10u32.pow(6)
+        ).unwrap()
+    ).unwrap();
+
+    // return amount including decimals
+    println!("quote of WETH in 2000 USD: {:?}", quote.to_exact());
+    Ok(quote.to_exact())
 }
 
 fn calc_new_ticks(current_tick: i32, percentage: f32) -> (i32, i32) {
@@ -405,7 +433,6 @@ async fn adjust_lower<P>(
     remove_liquidity_collect_fees(provider.clone(), config.clone()).await?;
 
     // calculate amounts needed for new position
-    // get nearest usable ticks
     let lower_tick = nearest_usable_tick(new_ticks.0, lp_position.pool.tick_spacing());
     let upper_tick = nearest_usable_tick(new_ticks.1, lp_position.pool.tick_spacing());
     
@@ -417,10 +444,10 @@ async fn adjust_lower<P>(
     let token0_amount = 
         if lp_position.pool.token0.address == config.weth_address.clone().parse::<AlloyAddress>()? || 
             lp_position.pool.token1.address == config.weth_address.clone().parse::<AlloyAddress>()? {
-            get_size_in_weth(config.quote_token_size_in_usd.clone()).await?
+            get_size_in_weth(provider.clone(), config.clone()).await?
     } else if lp_position.pool.token0.address == config.usdc_address.clone().parse::<AlloyAddress>()? ||
         lp_position.pool.token1.address == config.usdc_address.clone().parse::<AlloyAddress>()? {
-            config.quote_token_size_in_usd
+            (config.quote_token_size_in_usd as u32 * 10u32.pow(6)).to_string()
         }
       else { panic!("Neither token0 nor token1 are weth or usdc"); };
 
@@ -464,7 +491,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.ethers_provider_url.clone(),
     )?;
     let block_number = provider.get_block_number().await?;
-    println!("{block_number}");
+    println!("block: {block_number}");
 
     loop {
         // get current LP position based on ID from config file
@@ -484,8 +511,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // calculate new upper and lower ticks
         let new_ticks = calc_new_ticks(current_tick, config.range_percentage);
-
-        get_usdc_price_of_weth(provider.clone(), config.clone()).await?;
 
         // check if current tick is outside of our position range
         // and adjust the position as necessary
