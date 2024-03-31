@@ -6,6 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+num-traits = { version="0.2.16" }
 ethers = { version = "2.0", features = ["ws", "openssl"] }
 eyre = "0.6"
 serde = { version = "1.0.197", features = ["derive"] }

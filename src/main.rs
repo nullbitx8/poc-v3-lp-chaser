@@ -8,6 +8,7 @@ use ethers::prelude::{abigen, Http, LocalWallet, Provider, SignerMiddleware};
 use ethers::middleware::{Middleware, MiddlewareBuilder};
 use ethers::types::{Address as EthersAddress, TransactionRequest, U256};
 use alloy_primitives::{Address as AlloyAddress, Uint};
+use num_traits::ToPrimitive;
 use uniswap_sdk_core::token;
 use uniswap_sdk_core::prelude::{
     Address,
@@ -21,13 +22,15 @@ use uniswap_sdk_core::prelude::{
 use uniswap_v3_sdk::prelude::{
     CollectOptions,
     FeeAmount,
+    get_amount_1_delta,
     get_collectable_token_amounts,
     get_position,
     get_pool,
     get_sqrt_ratio_at_tick,
+    max_liquidity_for_amount0_precise,
+    nearest_usable_tick,
     Pool,
     Position,
-    nearest_usable_tick,
     remove_call_parameters,
     RemoveLiquidityOptions,
     sqrt_ratio_x96_to_price,
@@ -304,6 +307,10 @@ async fn get_size_in_weth(
         pool.token1.clone()
     );
     let price = price.unwrap();
+    println!(
+        "price of WETH in USD: {:?}",
+        price.to_significant(pool.token1.decimals, Rounding::RoundHalfUp).unwrap()
+    );
 
     // calculate amount of WETH needed based on config.quote_token_size_in_usd
     let inverted = price.clone().invert();
@@ -315,8 +322,14 @@ async fn get_size_in_weth(
     ).unwrap();
 
     // return amount including decimals
-    println!("quote of WETH in 2000 USD: {:?}", quote.to_exact());
     Ok(quote.to_exact())
+}
+
+// function to take a string decimal and remove any decimal points or leading zeros
+fn remove_decimals(decimal: String) -> String {
+    let decimal = decimal.replace(".", "");
+    let decimal = decimal.trim_start_matches("0").to_string();
+    decimal
 }
 
 fn calc_new_ticks(current_tick: i32, percentage: f32) -> (i32, i32) {
@@ -430,30 +443,68 @@ async fn adjust_lower<P>(
     new_ticks: &(i32, i32)
 ) -> Result<(), Box<dyn std::error::Error>> {
     // undo the current LP position and collect fees
-    remove_liquidity_collect_fees(provider.clone(), config.clone()).await?;
+    //remove_liquidity_collect_fees(provider.clone(), config.clone()).await?;
 
     // calculate amounts needed for new position
     let lower_tick = nearest_usable_tick(new_ticks.0, lp_position.pool.tick_spacing());
     let upper_tick = nearest_usable_tick(new_ticks.1, lp_position.pool.tick_spacing());
     
     // get sqrt ratio at the ticks
-    let sqrt_ratio_lower = get_sqrt_ratio_at_tick(lower_tick);
-    let sqrt_ratio_upper = get_sqrt_ratio_at_tick(upper_tick);
+    let sqrt_ratio_lower = get_sqrt_ratio_at_tick(lower_tick).unwrap();
+    let sqrt_ratio_upper = get_sqrt_ratio_at_tick(upper_tick).unwrap();
 
-    // get amount of token0 to use
+    // panic if both tokens are quote tokens
+    if lp_position.pool.token0.address == config.weth_address.clone().parse::<AlloyAddress>()?
+        && lp_position.pool.token1.address == config.usdc_address.clone().parse::<AlloyAddress>()? {
+            panic!("token0 is weth and token1 is usdc");
+    }
+    if lp_position.pool.token0.address == config.usdc_address.clone().parse::<AlloyAddress>()?
+        && lp_position.pool.token1.address == config.weth_address.clone().parse::<AlloyAddress>()? {
+            panic!("token0 is usdc and token1 is weth");
+    }
+
+    // get token0 amount
     let token0_amount = 
         if lp_position.pool.token0.address == config.weth_address.clone().parse::<AlloyAddress>()? || 
             lp_position.pool.token1.address == config.weth_address.clone().parse::<AlloyAddress>()? {
-            get_size_in_weth(provider.clone(), config.clone()).await?
-    } else if lp_position.pool.token0.address == config.usdc_address.clone().parse::<AlloyAddress>()? ||
-        lp_position.pool.token1.address == config.usdc_address.clone().parse::<AlloyAddress>()? {
-            (config.quote_token_size_in_usd as u32 * 10u32.pow(6)).to_string()
+                println!("getting amount of tokens to provide in weth");
+                get_size_in_weth(provider.clone(), config.clone()).await?
         }
-      else { panic!("Neither token0 nor token1 are weth or usdc"); };
+        else if lp_position.pool.token0.address == config.usdc_address.clone().parse::<AlloyAddress>()? ||
+            lp_position.pool.token1.address == config.usdc_address.clone().parse::<AlloyAddress>()? {
+                println!("getting amount of tokens to provide in usdc");
+                (config.quote_token_size_in_usd as u32 * 10u32.pow(6)).to_string()
+        }
+        else { panic!("Neither token0 nor token1 are weth or usdc"); };
 
+    println!("token0 amount: {:?}", token0_amount);
+
+    // remove decicmals or leading zeros
+    let token0_amount = remove_decimals(token0_amount);
+    println!("token0 amount as a whole number: {:?}", token0_amount);
 
     // get liquidity using lower and upper ticks + amount of token0 to use
+    // get token0_amount as a Uint from ruint library
+    let token0_amount = Uint::<256, 4>::from_str_radix(token0_amount.as_str(), 10).unwrap();
+
+    let liquidity_for_token_0 = max_liquidity_for_amount0_precise(
+        sqrt_ratio_lower.clone(),
+        sqrt_ratio_upper.clone(),
+        token0_amount
+    );
+    println!("liquidity for token 0: {:?}", liquidity_for_token_0);
+
     // use liquidity + lower and upper ticks to get amount of token1 needed 
+    let liquidity_for_token_0 = liquidity_for_token_0.to_u128().unwrap();
+
+    let token1_amount = get_amount_1_delta(
+        sqrt_ratio_lower.clone(),
+        sqrt_ratio_upper.clone(),
+        liquidity_for_token_0,
+        false
+    ).unwrap();
+    let token1_amount = token1_amount.to_string();
+    println!("token1 amount as a whole number: {:?}", token1_amount);
 
     // sell tokens as needed
 
@@ -514,6 +565,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // check if current tick is outside of our position range
         // and adjust the position as necessary
+        adjust_lower(
+            provider.clone(),
+            config.clone(),
+            lp_position.clone(),
+            &new_ticks
+        ).await?;
         if current_tick < lp_position.tick_lower {
             adjust_lower(
                 provider.clone(),
