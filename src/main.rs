@@ -1,10 +1,25 @@
+// TODO
+//  - [ ] refactor sending tx into its own function that accepts signer, value, calldata
+//  - [ ] Make Config global
+//  - [ ] Make Provider global, and a signer
+//  - [ ] Add logging
+//  - [ ] Add tests
 use std::env;
 use std::fs::File;
 use std::io::Read;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use serde::{Deserialize};
-use ethers::prelude::{abigen, Http, LocalWallet, Provider, SignerMiddleware};
+use ethers::prelude::{
+    abigen,
+    BlockId,
+    BlockNumber,
+    Http,
+    LocalWallet,
+    Provider,
+    Signer,
+    SignerMiddleware
+};
 use ethers::middleware::{Middleware, MiddlewareBuilder};
 use ethers::types::{Address as EthersAddress, TransactionRequest, U256};
 use alloy_primitives::{Address as AlloyAddress, Uint};
@@ -14,26 +29,38 @@ use uniswap_sdk_core::prelude::{
     Address,
     Currency,
     CurrencyAmount,
+    CurrencyLike,
     Percent,
     Price,
     Rounding,
     Token,
+    TradeType,
 };
 use uniswap_v3_sdk::prelude::{
+    add_call_parameters,
+    AddLiquidityOptions,
+    AddLiquiditySpecificOptions,
     CollectOptions,
+    EphemeralTickDataProvider,
     FeeAmount,
     get_amount_1_delta,
     get_collectable_token_amounts,
     get_position,
     get_pool,
     get_sqrt_ratio_at_tick,
-    max_liquidity_for_amount0_precise,
+    max_liquidity_for_amount0_imprecise,
+    MintSpecificOptions,
     nearest_usable_tick,
+    NoTickDataProvider,
     Pool,
     Position,
     remove_call_parameters,
     RemoveLiquidityOptions,
+    Route,
     sqrt_ratio_x96_to_price,
+    swap_call_parameters,
+    SwapOptions,
+    Trade,
     u256_to_big_int,
 };
 
@@ -113,51 +140,45 @@ async fn fetch_token(
 }
 */
 
-/*
 async fn fetch_pool(
     provider: Provider<Http>,
-    address: String,
-    chain_id: u32
-) -> Result<Pool, Box<dyn std::error::Error>> {
+    config: Config,
+) -> Result<Pool<NoTickDataProvider>, Box<dyn std::error::Error>> {
     let client = Arc::new(provider.clone());
-    let address = address.parse::<Address>()?;
 
     abigen!(
         UniswapV3Pool,
         "./src/abis/UniswapV3Pool.json",
     );
     let v3_pool = UniswapV3Pool::new(
-        address.clone(),
+        config.uni_v3_pool_address.parse::<EthersAddress>()?,
         client
     );
 
     let token0 = v3_pool.token_0().call().await?;
-    let token0 = fetch_token(
-        provider.clone(),
-        token0.clone().to_string(),
-        chain_id
-    ).await?;
-
     let token1 = v3_pool.token_1().call().await?;
-    let token1 = fetch_token(
-        provider.clone(),
-        token1.clone().to_string(),
-        chain_id
+    let fee_amount = v3_pool.fee().call().await?;
+    let fee_amount = match fee_amount {
+        100 => FeeAmount::LOWEST,
+        500 => FeeAmount::LOW,
+        3000 => FeeAmount::MEDIUM,
+        10000 => FeeAmount::HIGH,
+        _ => panic!("invalid fee amount")
+    };
+
+    // get pool
+    let pool = get_pool(
+        config.chain_id,
+        config.uniswap_v3_factory_address.parse::<AlloyAddress>()?,
+        token0.to_fixed_bytes().into(),
+        token1.to_fixed_bytes().into(),
+        fee_amount,
+        Arc::new(provider),
+        None
     ).await?;
 
-    let slot0 = v3_pool.slot_0().call().await?;
-    let fee_amount = v3_pool.fee().call().await?;
-    let liquidity = v3_pool.liquidity().call().await?;
-
-    Pool::new(
-        token0,
-        token1,
-        fee_amount.into(),
-        slot0.0,  // sqrt ratio
-        liquidity,
-    )
+    Ok(pool)
 }
-*/
 
 /*
 async fn fetch_lp_position(
@@ -197,6 +218,88 @@ async fn fetch_lp_position(
     )
 }
 */
+
+async fn erc20_balance_of(
+    provider: Provider<Http>,
+    token_address: String,
+    target_address: String
+) -> Result<String, Box<dyn std::error::Error>> {
+    // create an instance of the IERC20 contract
+    abigen!(
+        IERC20,
+        "./src/abis/IERC20.json",
+    );
+    let token_address = token_address.parse::<EthersAddress>()?;
+    let client = Arc::new(provider);
+    let token = IERC20::new(
+        token_address,
+        client.clone()
+    );
+
+    // call the contract method to fetch the balance of the wallet
+    let balance = token.balance_of(
+        target_address.parse::<EthersAddress>()?
+    ).call().await?;
+
+    Ok(balance.to_string())
+}
+
+async fn erc20_approve(
+    provider: Provider<Http>,
+    config: Config,
+    token: Token,
+    spender: String,
+    amount: U256
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client = Arc::new(provider.clone());
+    let caller = config.wallet_address.parse::<EthersAddress>()?;
+    let spender = spender.parse::<EthersAddress>()?;
+
+    // create an instance of the IERC20 contract
+    abigen!(
+        IERC20,
+        "./src/abis/IERC20.json",
+    );
+    let token_address = token.address.to_string().parse::<EthersAddress>()?;
+    let token = IERC20::new(
+        token_address.clone(),
+        client
+    );
+
+    // check if spender is already approved to spend the token
+    let allowance = token.allowance(
+        caller.clone(),
+        spender.clone()
+    ).call().await?;
+    if allowance >= amount {
+        return Ok(());
+    }
+
+    // call the contract method to approve the spender to spend the token
+    println!("approving {spender} to spend {token_address} {amount}");
+    let function_call = token.approve(
+        spender.clone(),
+        amount.clone()
+    );
+    let calldata = function_call.calldata().unwrap();
+
+    let signer = config.wallet_private_key.as_str().parse::<LocalWallet>()?;            
+    let signer = signer.with_chain_id(config.chain_id);
+    let client = provider.with_signer(signer);                                          
+    let tx = TransactionRequest::new()                                                  
+        .to(token_address)                                                              
+        .data(calldata);                                                                
+    let pending_tx = client.send_transaction(tx, None).await?;
+    
+    // get the mined tx
+    let receipt = pending_tx.await?.ok_or_else(|| eyre::format_err!("tx dropped from mempool"))?;
+    let tx = client.get_transaction(receipt.transaction_hash).await?;
+
+    println!("Sent tx: {}\n", serde_json::to_string(&tx)?);
+    println!("Tx receipt: {}", serde_json::to_string(&receipt)?);
+
+    Ok(())
+}
 
 async fn fetch_twap_tick(
     provider: Provider<Http>,
@@ -325,6 +428,96 @@ async fn get_size_in_weth(
     Ok(quote.to_exact())
 }
 
+async fn swap_token_for_token(
+    provider: Provider<Http>,
+    config: Config,
+    token_in: Token,
+    token_out: Token,
+    pool_fee: FeeAmount,
+    amount: String,
+    tick_provider: EphemeralTickDataProvider
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pool = get_pool(
+        config.chain_id,
+        config.uniswap_v3_factory_address.parse::<AlloyAddress>()?,
+        token_in.address.clone(),
+        token_out.address.clone(),
+        pool_fee,
+        Arc::new(provider.clone()),
+        None
+    ).await?;
+
+    println!("getting pool with tick data provider: {:?}", pool);
+    let pool = Pool::new_with_tick_data_provider(
+        pool.token0.clone(),
+        pool.token1.clone(),
+        pool.fee.clone(),
+        pool.sqrt_ratio_x96.clone(),
+        pool.liquidity.clone(),
+        tick_provider
+    )?;
+    println!("got pool with tick data provider: {:?}", pool);
+
+    // get the price
+    let price = sqrt_ratio_x96_to_price(
+        pool.sqrt_ratio_x96,
+        token_in.clone(),
+        token_out.clone()
+    ).unwrap();
+
+    // get the amount of token_out needed
+    let amount = CurrencyAmount::from_raw_amount(
+        token_in.clone(),
+        u256_to_big_int(amount.parse::<Uint<256, 4>>().unwrap())
+    ).unwrap();
+    let amount_out = price
+        .quote(amount.clone())?
+        .to_exact();
+
+    // set deadline 2 minutes from now
+    let deadline = (
+        SystemTime::now() + Duration::from_secs(2 * 60)
+    ).duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+
+    // configure swap options
+    let options = SwapOptions {
+        slippage_tolerance: Percent::new(1, 100),
+        recipient: config.wallet_address.parse().unwrap(),
+        deadline: deadline.to_string().parse().unwrap(),
+        input_token_permit: None,
+        sqrt_price_limit_x96: None,
+        fee: None,
+    };
+
+    let trade = Trade::from_route(
+        Route::new(vec![pool.clone()], token_in.clone(), token_out.clone()),
+        amount.clone(),
+        TradeType::ExactInput,
+    )?;
+
+    // prepare the input for router swap
+    let method_params = swap_call_parameters(&mut [trade], options.clone()).unwrap();
+    let value = convert_to_ethers_u256(method_params.value);
+
+    // prepare tx
+    let signer = config.wallet_private_key.as_str().parse::<LocalWallet>()?;
+    let client = provider.with_signer(signer);
+    let tx = TransactionRequest::new()
+        .to(config.uniswap_nfpm_address)
+        .value(value)
+        .data(method_params.calldata);
+    let pending_tx = client.send_transaction(tx, None).await?;
+    
+    // get the mined tx
+    let receipt = pending_tx.await?.ok_or_else(|| eyre::format_err!("tx dropped from mempool"))?;
+    let tx = client.get_transaction(receipt.transaction_hash).await?;
+
+    println!("Sent tx: {}\n", serde_json::to_string(&tx)?);
+    println!("Tx receipt: {}", serde_json::to_string(&receipt)?);
+
+    Ok(())
+}
+
 // function to take a string decimal and remove any decimal points or leading zeros
 fn remove_decimals(decimal: String) -> String {
     let decimal = decimal.replace(".", "");
@@ -352,6 +545,141 @@ fn convert_to_ethers_u256(alloy_u256: Uint<256, 4>) -> U256 {
 
     // Create an ethers U256 from the bytes
     U256::from(bytes)
+}
+
+async fn create_lp_position(
+    provider: Provider<Http>,
+    config: Config,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("creating liquidity position");
+
+    // query v3 pool using address from config file
+    let pool = fetch_pool(
+        provider.clone(),
+        config.clone()
+    ).await?;
+    println!("got pool: {:?}", pool);
+
+    // get current price as a tick
+    println!("current tick: {:?}", pool.tick_current);
+
+    // calculate new upper and lower ticks
+    let new_ticks = calc_new_ticks(pool.tick_current, config.range_percentage);
+
+    // calculate amounts needed for new position
+    let lower_tick = nearest_usable_tick(new_ticks.0, pool.tick_spacing());
+    let upper_tick = nearest_usable_tick(new_ticks.1, pool.tick_spacing());
+
+    // get sqrt ratio at the ticks
+    let sqrt_ratio_lower = get_sqrt_ratio_at_tick(lower_tick).unwrap();
+    let sqrt_ratio_upper = get_sqrt_ratio_at_tick(upper_tick).unwrap();
+
+    // get token0 amount
+    let token0_amount = 
+        if pool.token0.address == config.weth_address.parse::<AlloyAddress>()? {
+            get_size_in_weth(provider.clone(), config.clone()).await?
+        }
+        else if pool.token0.address == config.usdc_address.parse::<AlloyAddress>()? {
+            (config.quote_token_size_in_usd as u32 * 10u32.pow(6)).to_string()
+        }
+        else { panic!("Neither token0 nor token1 are weth or usdc"); };
+
+    // remove decicmals or leading zeros
+    let token0_amount = remove_decimals(token0_amount);
+    println!("token0 amount needed as a whole number: {:?}", token0_amount);
+
+    // get liquidity using lower and upper ticks + amount of token0 to use
+    // get token0_amount as a Uint from ruint library
+    let token0_amount = Uint::<256, 4>::from_str_radix(token0_amount.as_str(), 10).unwrap();
+
+    let liquidity_for_token_0 = max_liquidity_for_amount0_imprecise(
+        pool.sqrt_ratio_x96.clone(),
+        sqrt_ratio_upper.clone(),
+        token0_amount
+    );
+    println!("liquidity for token 0: {:?}", liquidity_for_token_0);
+
+    // use liquidity + lower and upper ticks to get amount of token1 needed 
+    let liquidity_for_token_0 = liquidity_for_token_0.to_u128().unwrap();
+
+    let token1_amount = get_amount_1_delta(
+        sqrt_ratio_lower.clone(),
+        pool.sqrt_ratio_x96.clone(),
+        liquidity_for_token_0,
+        false
+    ).unwrap();
+    println!("token1 amount needed as a whole number: {:?}", token1_amount.to_string());
+
+    // configure options for adding liquidity to the pool
+    let deadline = (
+        SystemTime::now() + Duration::from_secs(2 * 60)
+    ).duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+
+    // configure add liquidity options
+    let options = AddLiquidityOptions {
+        slippage_tolerance: Percent::new(1, 100),
+        deadline: deadline.to_string().parse().unwrap(),
+        use_native: None,
+        token0_permit: None,
+        token1_permit: None,
+        specific_opts: AddLiquiditySpecificOptions::Mint(
+            MintSpecificOptions {
+                recipient: config.wallet_address.parse().unwrap(),
+                create_pool: false,
+            }
+        )
+    };
+
+    // create desired position
+    let position = Position::new(
+        pool.clone(),
+        liquidity_for_token_0,
+        lower_tick,
+        upper_tick
+    );
+
+    // prepare the input for nfpm add liquidity method
+    let method_params = add_call_parameters(
+        &mut position.clone(),
+        options
+    ).unwrap();
+
+    // allow nfpm to spend token0 and token1
+    erc20_approve(
+        provider.clone(),
+        config.clone(),
+        pool.token0.clone(),
+        config.uniswap_nfpm_address.clone(),
+        convert_to_ethers_u256(token0_amount)
+    ).await?;
+    erc20_approve(
+        provider.clone(),
+        config.clone(),
+        pool.token1.clone(),
+        config.uniswap_nfpm_address.clone(),
+        convert_to_ethers_u256(token1_amount)
+    ).await?;
+
+    // prepare tx
+    let value = convert_to_ethers_u256(method_params.value);
+    let signer = config.wallet_private_key.as_str().parse::<LocalWallet>()?;
+    let client = provider.with_signer(signer);
+    let tx = TransactionRequest::new()
+        .to(config.uniswap_nfpm_address.parse::<EthersAddress>()?)
+        .value(value)
+        .data(method_params.calldata);
+
+    // send tx to mempool
+    let pending_tx = client.send_transaction(tx, None).await?;
+
+    // get the mined tx
+    let receipt = pending_tx.await?.ok_or_else(|| eyre::format_err!("tx dropped from mempool"))?;
+    let tx = client.get_transaction(receipt.transaction_hash).await?;
+
+    println!("Sent tx: {}\n", serde_json::to_string(&tx)?);
+    println!("Tx receipt: {}", serde_json::to_string(&receipt)?);
+
+    Ok(())
 }
 
 async fn remove_liquidity_collect_fees(
@@ -450,8 +778,8 @@ async fn adjust_lower<P>(
     let upper_tick = nearest_usable_tick(new_ticks.1, lp_position.pool.tick_spacing());
     
     // get sqrt ratio at the ticks
-    let sqrt_ratio_lower = get_sqrt_ratio_at_tick(lower_tick).unwrap();
-    let sqrt_ratio_upper = get_sqrt_ratio_at_tick(upper_tick).unwrap();
+    let sqrt_ratio_lower = get_sqrt_ratio_at_tick(lower_tick.clone()).unwrap();
+    let sqrt_ratio_upper = get_sqrt_ratio_at_tick(upper_tick.clone()).unwrap();
 
     // panic if both tokens are quote tokens
     if lp_position.pool.token0.address == config.weth_address.clone().parse::<AlloyAddress>()?
@@ -481,13 +809,13 @@ async fn adjust_lower<P>(
 
     // remove decicmals or leading zeros
     let token0_amount = remove_decimals(token0_amount);
-    println!("token0 amount as a whole number: {:?}", token0_amount);
+    println!("token0 amount needed as a whole number: {:?}", token0_amount);
 
     // get liquidity using lower and upper ticks + amount of token0 to use
     // get token0_amount as a Uint from ruint library
     let token0_amount = Uint::<256, 4>::from_str_radix(token0_amount.as_str(), 10).unwrap();
 
-    let liquidity_for_token_0 = max_liquidity_for_amount0_precise(
+    let liquidity_for_token_0 = max_liquidity_for_amount0_imprecise(
         sqrt_ratio_lower.clone(),
         sqrt_ratio_upper.clone(),
         token0_amount
@@ -504,9 +832,54 @@ async fn adjust_lower<P>(
         false
     ).unwrap();
     let token1_amount = token1_amount.to_string();
-    println!("token1 amount as a whole number: {:?}", token1_amount);
+    println!("token1 amount needed as a whole number: {:?}", token1_amount);
 
-    // sell tokens as needed
+    // get wallet_address balance of token1
+    let wallet_balance_token1 = erc20_balance_of(
+        provider.clone(),
+        lp_position.pool.token1.address.to_string(),
+        config.wallet_address.clone()
+    ).await?;
+    println!("wallet balance of token1: {:?}", wallet_balance_token1);
+
+    // get wallet_address balance of token1
+    let wallet_balance_token0 = erc20_balance_of(
+        provider.clone(),
+        lp_position.pool.token0.clone().address.to_string(),
+        config.wallet_address.clone()
+    ).await?;
+    println!("wallet balance of token0: {:?}", wallet_balance_token0);
+
+    // calc the difference of token1 balance and token1_amount
+    let token1_difference = wallet_balance_token1.parse::<u128>().unwrap() - token1_amount.parse::<u128>().unwrap();
+    println!("token1 difference: {:?}", token1_difference);
+
+    // create ephemeral tick data provider
+    println!("creating tick provider");
+    let tick_provider = EphemeralTickDataProvider::new(
+        config.uni_v3_pool_address.clone().parse::<AlloyAddress>()?,
+        Arc::new(provider.clone()),
+        Some(lower_tick.clone()),
+        Some(upper_tick.clone()),
+        None
+    ).await?;
+    println!("created tick provider: {:?}", tick_provider);
+
+    // sell the difference of token1 for token0 on uniswap
+    swap_token_for_token(
+        provider.clone(),
+        config.clone(),
+        lp_position.pool.token1.clone(),
+        lp_position.pool.token0.clone(),
+        lp_position.pool.fee.clone(),
+        token1_difference.to_string(),
+        tick_provider
+    ).await?;
+
+    // then provide token0 and token1 to the pool
+    // then mint the new LP position
+    // then save the new LP position ID to the config file
+    // then return
 
     // create new position
 
@@ -544,6 +917,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let block_number = provider.get_block_number().await?;
     println!("block: {block_number}");
 
+    // if my_lp_position_id is 0, then create a new LP position
+    // and save the ID to the config file
+    if config.my_lp_position_id == 0 {
+        create_lp_position(
+            provider.clone(),
+            config.clone()
+        ).await?;
+    }
+
     loop {
         // get current LP position based on ID from config file
         //let lp_position = fetch_lp_position(provider.clone(), config.clone()).await?;
@@ -557,7 +939,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("lp position: {:?}", lp_position);
 
         // get current price as a tick
-        let current_tick = fetch_current_tick(provider.clone(), config.clone()).await?;
+        let current_tick = lp_position.pool.tick_current.clone();
         println!("current tick: {:?}", current_tick);
 
         // calculate new upper and lower ticks
