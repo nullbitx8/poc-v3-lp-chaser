@@ -7,21 +7,29 @@
 use std::env;
 use std::fs::File;
 use std::io::Read;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use serde::{Deserialize};
+use serde::{Deserialize, Serialize};
+use ethers::utils::keccak256;
 use ethers::prelude::{
     abigen,
+    Address as EthersAddress,
     BlockId,
     BlockNumber,
+    H160,
+    H256,
     Http,
     LocalWallet,
+    Log,
+    Middleware,
+    MiddlewareBuilder,
     Provider,
     Signer,
-    SignerMiddleware
+    SignerMiddleware,
+    TransactionRequest,
+    U256,
 };
-use ethers::middleware::{Middleware, MiddlewareBuilder};
-use ethers::types::{Address as EthersAddress, TransactionRequest, U256};
 use alloy_primitives::{Address as AlloyAddress, Uint};
 use num_traits::ToPrimitive;
 use uniswap_sdk_core::token;
@@ -66,7 +74,7 @@ use uniswap_v3_sdk::prelude::{
 };
 
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct Config {
     my_lp_position_id: usize,
     range_percentage: f32,
@@ -219,6 +227,29 @@ async fn fetch_lp_position(
     )
 }
 */
+
+/*
+ * Extract token ID from logs.
+ * It is the first parameter of the IncreaseLiquidity event.
+ */
+fn extract_token_id_from_logs(
+    logs: Vec<Log>
+) -> Result<U256, Box<dyn std::error::Error>> {
+    const event_sig: &str = "IncreaseLiquidity(uint256,uint128,uint256,uint256)";
+    let event_sig_hashed = H256::from(keccak256(event_sig.as_bytes()));
+
+    for log in logs {
+        let topics: Vec<H256> = log.topics;
+        let data: Vec<u8> = log.data.to_vec();
+
+        // decode IncreaseLiquidity event
+        if topics.len() > 0 && topics[0] == event_sig_hashed {
+            let token_id = U256::from_big_endian(&topics[1].as_bytes()[29..32]);
+            return Ok(token_id);
+        }
+    }
+    panic!("IncreaseLiquidity event or not found in logs");
+}
 
 async fn erc20_balance_of(
     provider: Provider<Http>,
@@ -575,6 +606,7 @@ fn convert_to_ethers_u256(alloy_u256: Uint<256, 4>) -> U256 {
 async fn create_lp_position(
     provider: Provider<Http>,
     config: Config,
+    config_file_path: &str
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("creating liquidity position");
 
@@ -721,17 +753,25 @@ async fn create_lp_position(
         .to(config.uniswap_nfpm_address.parse::<EthersAddress>()?)
         .value(value)
         .data(method_params.calldata);
-    println!("tx to add liquidity: {:?}", tx);
 
     // send tx to mempool
+    println!("sending liquidity add tx to mempool");
     let pending_tx = client.send_transaction(tx, None).await?;
 
     // get the mined tx
     let receipt = pending_tx.await?.ok_or_else(|| eyre::format_err!("tx dropped from mempool"))?;
-    let tx = client.get_transaction(receipt.transaction_hash).await?;
+    println!("Tx mined, hash: {:?}", receipt.transaction_hash);
 
-    println!("Sent tx: {}\n", serde_json::to_string(&tx)?);
-    println!("Tx receipt: {}", serde_json::to_string(&receipt)?);
+    // get token ID from logs in tx receipt
+    let token_id = extract_token_id_from_logs(receipt.logs)?;
+    println!("New LP token ID: {:?}", token_id);
+
+    // save token ID to config file
+    let mut config = config.clone();
+    config.my_lp_position_id = token_id.as_usize();
+    let config = serde_json::to_string_pretty(&config)?;
+    std::fs::write(config_file_path, config)?;
+    println!("Wrote new LP position token ID to config file");
 
     Ok(())
 }
@@ -976,7 +1016,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if config.my_lp_position_id == 0 {
         create_lp_position(
             provider.clone(),
-            config.clone()
+            config.clone(),
+            &args[1]
         ).await?;
     }
 
