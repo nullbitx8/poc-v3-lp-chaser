@@ -60,6 +60,7 @@ use uniswap_v3_sdk::prelude::{
     sqrt_ratio_x96_to_price,
     swap_call_parameters,
     SwapOptions,
+    ToEthers,
     Trade,
     u256_to_big_int,
 };
@@ -244,6 +245,30 @@ async fn erc20_balance_of(
     Ok(balance.to_string())
 }
 
+async fn assert_balance(
+    provider: Provider<Http>,
+    config: Config,
+    token: Token,
+    amount: U256
+) -> Result<(), Box<dyn std::error::Error>> {
+    let balance = erc20_balance_of(
+        provider.clone(),
+        token.address.to_string(),
+        config.wallet_address.clone()
+    ).await?;
+
+    if balance.parse::<U256>().unwrap() < amount {
+        panic!(
+            "insufficient balance of token {:?}; balance: {:?}, needed: {:?}",
+            token.symbol.unwrap(),
+            balance,
+            amount
+        );
+    }
+
+    Ok(())
+}
+
 async fn erc20_approve(
     provider: Provider<Http>,
     config: Config,
@@ -276,10 +301,10 @@ async fn erc20_approve(
     }
 
     // call the contract method to approve the spender to spend the token
-    println!("approving {spender} to spend {token_address} {amount}");
+    println!("approving {spender} to spend {token_address} MAX U256");
     let function_call = token.approve(
         spender.clone(),
-        amount.clone()
+        U256::MAX
     );
     let calldata = function_call.calldata().unwrap();
 
@@ -644,30 +669,59 @@ async fn create_lp_position(
         options
     ).unwrap();
 
+    let token0_amount = token0_amount.to_ethers();
+    let mut token1_amount = token1_amount.to_ethers();
+    println!("token0 amount: {:?}", token0_amount);
+    println!("token1 amount: {:?}", token1_amount);
+
+    // TODO figure out why nfpm calculates token1 needed as 1 instead of 0
+    // and if we are doing the calculation wrong, then fix this
+    if token1_amount == U256::zero() {
+        token1_amount = U256::from(1);
+    }
+    println!("token1 amount: {:?}", token1_amount);
+
+    // assert sufficient balance of tokens
+    assert_balance(
+        provider.clone(),
+        config.clone(),
+        pool.token0.clone(),
+        token0_amount.clone()
+    ).await?;
+
+    assert_balance(
+        provider.clone(),
+        config.clone(),
+        pool.token1.clone(),
+        token1_amount.clone()
+    ).await?;
+
     // allow nfpm to spend token0 and token1
     erc20_approve(
         provider.clone(),
         config.clone(),
         pool.token0.clone(),
         config.uniswap_nfpm_address.clone(),
-        convert_to_ethers_u256(token0_amount)
+        token0_amount
     ).await?;
     erc20_approve(
         provider.clone(),
         config.clone(),
         pool.token1.clone(),
         config.uniswap_nfpm_address.clone(),
-        convert_to_ethers_u256(token1_amount)
+        token1_amount
     ).await?;
 
     // prepare tx
     let value = convert_to_ethers_u256(method_params.value);
     let signer = config.wallet_private_key.as_str().parse::<LocalWallet>()?;
+    let signer = signer.with_chain_id(config.chain_id);
     let client = provider.with_signer(signer);
     let tx = TransactionRequest::new()
         .to(config.uniswap_nfpm_address.parse::<EthersAddress>()?)
         .value(value)
         .data(method_params.calldata);
+    println!("tx to add liquidity: {:?}", tx);
 
     // send tx to mempool
     let pending_tx = client.send_transaction(tx, None).await?;
