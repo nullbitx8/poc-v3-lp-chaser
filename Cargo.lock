@@ -2440,6 +2440,7 @@ dependencies = [
  "tokio",
  "uniswap-sdk-core",
  "uniswap-v3-sdk",
+ "uniswap_v3_math",
 ]
 
 [[package]]
