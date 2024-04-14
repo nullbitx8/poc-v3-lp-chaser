@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 use ethers::utils::{
+    format_units,
     keccak256,
     parse_units,
 };
@@ -36,6 +37,7 @@ use num_traits::ToPrimitive;
 use uniswap_sdk_core::prelude::{
     Currency,
     CurrencyAmount,
+    MAX_UINT256,
     Percent,
     Rounding,
     Token,
@@ -410,6 +412,7 @@ async fn get_size_in_weth(
         "price of WETH in USD: {:?}",
         price.to_significant(pool.token1.decimals, Rounding::RoundHalfUp).unwrap()
     );
+    println!("quote token size desired in USD: {:?}", config.quote_token_size_in_usd);
 
     // calculate amount of WETH needed based on config.quote_token_size_in_usd
     let inverted = price.clone().invert();
@@ -420,8 +423,12 @@ async fn get_size_in_weth(
         ).unwrap()
     ).unwrap();
 
-    // return amount including decimals
-    Ok(quote.to_exact())
+    // return amount of WETH needed as a string
+    let quote = quote.to_significant(18, Rounding::RoundHalfUp).unwrap();
+    let quote = parse_units(quote, 18).unwrap();
+    let quote = quote.to_string();
+
+    Ok(quote)
 }
 
 async fn swap_token_for_token_given_amount_in(
@@ -465,6 +472,7 @@ async fn swap_token_for_token_given_amount_in(
     let range_ticks = calc_new_ticks(pool.tick_current, config.tick_data_provider_range);
     let lower_tick = nearest_usable_tick(range_ticks.0, pool.tick_spacing());
     let upper_tick = nearest_usable_tick(range_ticks.1, pool.tick_spacing());
+    println!("getting tick provider, lower_tick: {:?}, upper_tick: {:?}", lower_tick, upper_tick);
     let tick_provider = EphemeralTickDataProvider::new(
         config.uni_v3_pool_address.clone().parse::<AlloyAddress>()?,
         Arc::new(provider.clone()),
@@ -552,7 +560,7 @@ async fn swap_token_for_token_given_amount_out(
         None
     ).await?;
 
-    let range_ticks = calc_new_ticks(pool.tick_current, 10.0);
+    let range_ticks = calc_new_ticks(pool.tick_current, config.tick_data_provider_range);
     let lower_tick = nearest_usable_tick(range_ticks.0, pool.tick_spacing());
     let upper_tick = nearest_usable_tick(range_ticks.1, pool.tick_spacing());
     let tick_provider = EphemeralTickDataProvider::new(
@@ -799,7 +807,6 @@ async fn create_lp_position(
             (config.quote_token_size_in_usd as u32 * 10u32.pow(6)).to_string()
         }
         else { panic!("Neither token0 nor token1 are weth or usdc"); };
-    let quote_token_amount = remove_decimals(quote_token_amount);
     let quote_token_amount = Uint::<256, 4>::from_str_radix(quote_token_amount.as_str(), 10).unwrap();
 
     // get liquidity for quote token
@@ -974,25 +981,17 @@ async fn remove_liquidity_collect_fees(
         return Ok(());
     }
 
-    // get collectible fees amounts 
-    let collectible_token_amounts = get_collectable_token_amounts(
-        config.chain_id,
-        config.uniswap_nfpm_address.parse::<AlloyAddress>()?,
-        config.my_lp_position_id.to_string().parse().unwrap(),
-        Arc::new(provider.clone()),
-        None
-    ).await?;
-    println!("collectible token amounts: {:?}", collectible_token_amounts);
+    // calculate the largest amount of owed token0 and token1 that can be collected
+    let burn_amounts = position.clone().burn_amounts_with_slippage(&Percent::new(1, 100)).unwrap();
+    let burn_amounts = (u256_to_big_int(burn_amounts.0), u256_to_big_int(burn_amounts.1));
     let currency_owed0_amount = CurrencyAmount::from_raw_amount(
         Currency::Token(position.pool.token0.clone()),
-        u256_to_big_int(collectible_token_amounts.0),
+         MAX_UINT256.clone() - burn_amounts.0
     )?;
-    println!("currency owed 0 amount: {:?}", currency_owed0_amount);
     let currency_owed1_amount = CurrencyAmount::from_raw_amount(
         Currency::Token(position.pool.token1.clone()),
-        u256_to_big_int(collectible_token_amounts.1),
+        MAX_UINT256.clone() - burn_amounts.1
     )?;
-    println!("currency owed 1 amount: {:?}", currency_owed1_amount);
 
     // set deadline 2 minutes from now
     let deadline = (
@@ -1153,15 +1152,15 @@ fn print_lp_position_details(lp_position: &Position<NoTickDataProvider>) {
     println!("LP Position");
     println!("-----------");
     println!(
-        "Symbol: {:?}/{:?}",
+        "Symbol:\t\t\t{:?}/{:?}",
         lp_position.pool.token1.symbol.clone().unwrap(),
         lp_position.pool.token0.symbol.clone().unwrap()
     );
-    println!("Lower Tick: {:?}", lp_position.tick_lower);
-    println!("Upper Tick: {:?}", lp_position.tick_upper);
-    println!("Current Tick: {:?}", lp_position.pool.tick_current);
-    println!("Our Liquidity: {:?}", lp_position.liquidity);
-    println!("Pool Liquidity: {:?}", lp_position.pool.liquidity);
+    println!("Lower Tick:\t\t{:?}", lp_position.tick_lower);
+    println!("Upper Tick:\t\t{:?}", lp_position.tick_upper);
+    println!("Current Tick:\t\t{:?}", lp_position.pool.tick_current);
+    println!("Our Liquidity:\t\t{:?}", lp_position.liquidity);
+    println!("Pool Liquidity:\t\t{:?}", lp_position.pool.liquidity);
     println!("TODO: calculate total liquidity in the range instead of entire pool.");
     println!("");
 }
