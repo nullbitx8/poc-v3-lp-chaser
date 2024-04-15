@@ -94,7 +94,8 @@ struct Config {
     wallet_address: String,
     wallet_private_key: String,
     ethers_provider_url: String,
-    chain_id: u64
+    chain_id: u64,
+    sentry_dsn: String,
 }
 
 fn read_config(config_file_path: &str) -> Result<Config, Box<dyn std::error::Error>> {
@@ -1165,8 +1166,7 @@ fn print_lp_position_details(lp_position: &Position<NoTickDataProvider>) {
     println!("");
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get path to config file from command-line arguments
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
@@ -1178,73 +1178,86 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Read configuration from file
     let mut config = read_config(config_file_path)?;
 
+    // set up sentry
+    let _guard = sentry::init((config.sentry_dsn.clone(), sentry::ClientOptions {
+        release: sentry::release_name!(),
+        ..Default::default()
+    }));
+
     // Set up ethers provider
     let provider = Provider::<Http>::try_from(
         config.ethers_provider_url.clone(),
     )?;
-    let block_number = provider.get_block_number().await?;
-    println!("Block Number: {block_number}");
-    println!("");
 
-    loop {
-        // reload config file
-        config = read_config(config_file_path)?;
-
-        // if my_lp_position_id is 0, then create a new LP position
-        // and save the ID to the config file
-        if config.my_lp_position_id == 0 {
-            println!("no LP position ID found in config file, creating new LP position");
-            create_lp_position(
-                provider.clone(),
-                config.clone(),
-                config_file_path
-            ).await?;
-
-            // reload config file
-            config = read_config(config_file_path)?;
-        }
-
-        // get current LP position based on ID from config file
-        let lp_position = get_position(
-            config.chain_id.clone(),
-            config.uniswap_nfpm_address.clone().parse::<AlloyAddress>()?,
-            config.my_lp_position_id.clone().to_string().parse().unwrap(),
-            Arc::new(provider.clone()),
-            None
-        ).await?;
-        print_lp_position_details(&lp_position);
-
-        // check if current tick is outside of our position range
-        // and adjust the position as necessary
-        let current_tick = lp_position.pool.tick_current.clone();
-        if current_tick < lp_position.tick_lower {
-            println!("current tick is lower than our LP price range, adjusting lower.");
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let block_number = provider.get_block_number().await.unwrap();
+            println!("Block Number: {block_number}");
             println!("");
-            adjust_lower(
-                provider.clone(),
-                config.clone(),
-                lp_position.clone(),
-                config_file_path
-            ).await?;
-        }
-        else if current_tick > lp_position.tick_upper {
-            println!("current tick is higher than our LP price range, adjusting higher.");
-            println!("");
-            adjust_higher(
-                provider.clone(),
-                config.clone(),
-                config_file_path
-            ).await?;
-        }
-        else {
-            println!("current tick is within our LP price range");
-        }
 
-        // wait 5 minutes
-        println!("waiting for {} seconds", config.seconds_to_wait);
-        println!("");
-        std::thread::sleep(Duration::from_secs(config.seconds_to_wait as u64));
-    }
+            loop {
+                // reload config file
+                config = read_config(config_file_path).unwrap();
+
+                // if my_lp_position_id is 0, then create a new LP position
+                // and save the ID to the config file
+                if config.my_lp_position_id == 0 {
+                    println!("no LP position ID found in config file, creating new LP position");
+                    create_lp_position(
+                        provider.clone(),
+                        config.clone(),
+                        config_file_path
+                    ).await.unwrap();
+
+                    // reload config file
+                    config = read_config(config_file_path).unwrap();
+                }
+
+                // get current LP position based on ID from config file
+                let lp_position = get_position(
+                    config.chain_id.clone(),
+                    config.uniswap_nfpm_address.clone().parse::<AlloyAddress>().unwrap(),
+                    config.my_lp_position_id.clone().to_string().parse().unwrap(),
+                    Arc::new(provider.clone()),
+                    None
+                ).await.unwrap();
+                print_lp_position_details(&lp_position);
+
+                // check if current tick is outside of our position range
+                // and adjust the position as necessary
+                let current_tick = lp_position.pool.tick_current.clone();
+                if current_tick < lp_position.tick_lower {
+                    println!("current tick is lower than our LP price range, adjusting lower.");
+                    println!("");
+                    adjust_lower(
+                        provider.clone(),
+                        config.clone(),
+                        lp_position.clone(),
+                        config_file_path
+                    ).await.unwrap();
+                }
+                else if current_tick > lp_position.tick_upper {
+                    println!("current tick is higher than our LP price range, adjusting higher.");
+                    println!("");
+                    adjust_higher(
+                        provider.clone(),
+                        config.clone(),
+                        config_file_path
+                    ).await.unwrap();
+                }
+                else {
+                    println!("current tick is within our LP price range");
+                }
+
+                // wait 5 minutes
+                println!("waiting for {} seconds", config.seconds_to_wait);
+                println!("");
+                std::thread::sleep(Duration::from_secs(config.seconds_to_wait as u64));
+            }
+        });
 
     Ok(())
 }
