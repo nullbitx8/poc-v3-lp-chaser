@@ -1,9 +1,11 @@
 // TODO
-//  - [ ] refactor sending tx into its own function that accepts signer, value, calldata
+//  - [ ] add logs and timestamps to the logs
+//  - [ ] collect data on fees collected as well as other data points
+//  - [ ] fix bug with insufficient funds... have to sell extra tokens before creating LP
+//          this can be improved in the future by having own smart contract
 //  - [ ] replace convert_to_ethers_u256 with to_ethers()
 //  - [ ] Make Config global
 //  - [ ] Make Provider global, and a signer
-//  - [ ] Add logging
 //  - [ ] Add tests
 use std::env;
 use std::fs::File;
@@ -12,7 +14,6 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 use ethers::utils::{
-    format_units,
     keccak256,
     parse_units,
 };
@@ -51,7 +52,6 @@ use uniswap_v3_sdk::prelude::{
     CollectOptions,
     EphemeralTickDataProvider,
     FeeAmount,
-    get_collectable_token_amounts,
     get_position,
     get_pool,
     get_sqrt_ratio_at_tick,
@@ -652,7 +652,7 @@ async fn swap_token_for_token_given_amount_out(
     Ok(())
 }
 
-async fn buy_token0_if_needed(
+async fn buy_sell_token0_if_needed(
     provider: Provider<Http>,
     config: Config,
     pool: Pool<NoTickDataProvider>,
@@ -665,29 +665,44 @@ async fn buy_token0_if_needed(
         config.wallet_address.clone()
     ).await?;
 
-    // if balance > token1_amount, return
+    // sell the extra token0
     if balance > token0_amount {
-        println!("balance: {:?}, token0_amount: {:?}", balance, token0_amount);
-        println!("balance > token0_amount, no need to buy token0");
-        return Ok(());
+        let balance_diff = balance - token0_amount;
+        println!("Have more token0 than needed, selling extra token0 {:?}", balance_diff);
+
+        swap_token_for_token_given_amount_in(
+            provider.clone(),
+            config.clone(),
+            pool.token0.clone(),
+            pool.token1.clone(),
+            pool.fee.clone(),
+            balance_diff,
+        ).await?;
     }
+    // buy the needed token0
+    else if balance < token0_amount {
+        // calculate the difference between balance and token1_amount
+        let balance_diff = token0_amount - balance;
+        println!("Have less token0 than needed, buying needed token0 {:?}", balance_diff);
 
-    // calculate the difference between balance and token1_amount
-    let balance_diff = token0_amount - balance;
-
-    swap_token_for_token_given_amount_out(
-        provider.clone(),
-        config.clone(),
-        pool.token1.clone(),
-        pool.token0.clone(),
-        pool.fee.clone(),
-        balance_diff,
-    ).await?;
+        swap_token_for_token_given_amount_out(
+            provider.clone(),
+            config.clone(),
+            pool.token1.clone(),
+            pool.token0.clone(),
+            pool.fee.clone(),
+            balance_diff,
+        ).await?;
+    }
+    // have just enough token0
+    else {
+        println!("have just enough token1, no need to buy or sell token1");
+    }
 
     Ok(())
 }
 
-async fn buy_token1_if_needed(
+async fn buy_sell_token1_if_needed(
     provider: Provider<Http>,
     config: Config,
     pool: Pool<NoTickDataProvider>,
@@ -700,34 +715,40 @@ async fn buy_token1_if_needed(
         config.wallet_address.clone()
     ).await?;
 
-    // if balance > token1_amount, return
+    // sell the extra token1
     if balance > token1_amount {
-        println!("balance: {:?}, token1_amount: {:?}", balance, token1_amount);
-        println!("balance > token1_amount, no need to buy token1");
-        return Ok(());
+        let balance_diff = balance - token1_amount;
+        println!("Have more token1 than needed, selling extra token1 {:?}", balance_diff);
+
+        swap_token_for_token_given_amount_in(
+            provider.clone(),
+            config.clone(),
+            pool.token1.clone(),
+            pool.token0.clone(),
+            pool.fee.clone(),
+            balance_diff,
+        ).await?;
+    }
+    // buy the needed token1
+    else if balance < token1_amount {
+        let balance_diff = token1_amount - balance;
+        println!("Have less token1 than needed, buying needed token1 {:?}", balance_diff);
+
+        swap_token_for_token_given_amount_out(
+            provider.clone(),
+            config.clone(),
+            pool.token0.clone(),
+            pool.token1.clone(),
+            pool.fee.clone(),
+            balance_diff,
+        ).await?;
+    }
+    // have just enough token1
+    else {
+        println!("have just enough token1, no need to buy or sell token1");
     }
 
-    // calculate the difference between balance and token1_amount
-    let balance_diff = token1_amount - balance;
-
-    swap_token_for_token_given_amount_out(
-        provider.clone(),
-        config.clone(),
-        pool.token0.clone(),
-        pool.token1.clone(),
-        pool.fee.clone(),
-        balance_diff,
-    ).await?;
-
     Ok(())
-}
-
-
-// function to take a string decimal and remove any decimal points or leading zeros
-fn remove_decimals(decimal: String) -> String {
-    let decimal = decimal.replace(".", "");
-    let decimal = decimal.trim_start_matches("0").to_string();
-    decimal
 }
 
 fn calc_new_ticks(current_tick: i32, percentage: f32) -> (i32, i32) {
@@ -848,20 +869,20 @@ async fn create_lp_position(
     println!("token1 amount: {:?}", token1_amount);
     println!("");
 
-    // if token0 is quote token, buy token1 if needed
+    // if token0 is quote token, buy/sell token1 as needed
     if pool.token0.address == config.weth_address.parse::<AlloyAddress>()? ||
         pool.token0.address == config.usdc_address.parse::<AlloyAddress>()? {
-        buy_token1_if_needed(
+        buy_sell_token1_if_needed(
             provider.clone(),
             config.clone(),
             pool.clone(),
             token1_amount.clone()
         ).await?;
     } 
-    // if token1 is quote token, buy token0 if needed
+    // if token1 is quote token, buy/sell token0 if needed
     else if pool.token1.address == config.weth_address.parse::<AlloyAddress>()? ||
         pool.token1.address == config.usdc_address.parse::<AlloyAddress>()? {
-        buy_token0_if_needed(
+        buy_sell_token0_if_needed(
             provider.clone(),
             config.clone(),
             pool.clone(),
@@ -1045,62 +1066,9 @@ async fn remove_liquidity_collect_fees(
     Ok(())
 }
 
-async fn sell_leftover_non_quote_token(
-    provider: Provider<Http>,
-    config: Config,
-    lp_position: Position<NoTickDataProvider>
-) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Selling leftover non-quote token.");
-
-    // if token0 is quote token, sell token1
-    if lp_position.pool.token0.address == config.weth_address.parse::<AlloyAddress>()? ||
-        lp_position.pool.token0.address == config.usdc_address.parse::<AlloyAddress>()? {
-
-        println!("token0 is quote token, selling token1");
-        let token1_bal = erc20_balance_of(
-            provider.clone(),
-            lp_position.pool.token1.address.to_string(),
-            config.wallet_address.clone()
-        ).await?;
-
-        swap_token_for_token_given_amount_in(
-            provider.clone(),
-            config.clone(),
-            lp_position.pool.token1.clone(),
-            lp_position.pool.token0.clone(),
-            lp_position.pool.fee.clone(),
-            token1_bal
-        ).await?;
-    } 
-    // if token1 is quote token, sell token0
-    else if lp_position.pool.token1.address == config.weth_address.parse::<AlloyAddress>()? ||
-        lp_position.pool.token1.address == config.usdc_address.parse::<AlloyAddress>()? {
-
-        println!("token1 is quote token, selling token0");
-        let token0_bal = erc20_balance_of(
-            provider.clone(),
-            lp_position.pool.token0.address.to_string(),
-            config.wallet_address.clone()
-        ).await?;
-
-        swap_token_for_token_given_amount_in(
-            provider.clone(),
-            config.clone(),
-            lp_position.pool.token0.clone(),
-            lp_position.pool.token1.clone(),
-            lp_position.pool.fee.clone(),
-            token0_bal
-        ).await?;
-    }
-    else { panic!("Neither token0 nor token1 are weth or usdc"); }
-
-    Ok(())
-}
-
 async fn adjust_lower(
     provider: Provider<Http>,
     config: Config,
-    lp_position: Position<NoTickDataProvider>,
     config_file_path: &str
 ) -> Result<(), Box<dyn std::error::Error>> {
     // undo the current LP position and collect fees
@@ -1115,13 +1083,6 @@ async fn adjust_lower(
         provider.clone(),
         config.clone(),
         config_file_path
-    ).await?;
-
-    // sell any leftover of the non-quote token
-    sell_leftover_non_quote_token(
-        provider.clone(),
-        config.clone(),
-        lp_position.clone()
     ).await?;
 
     Ok(())
@@ -1235,7 +1196,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     adjust_lower(
                         provider.clone(),
                         config.clone(),
-                        lp_position.clone(),
                         config_file_path
                     ).await.unwrap();
                 }
