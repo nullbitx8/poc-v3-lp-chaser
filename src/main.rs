@@ -1,5 +1,5 @@
 // TODO
-//  - [ ] add logs and timestamps to the logs
+//  - [ ] calculate liquidity in range of ticks
 //  - [ ] collect data on fees collected as well as other data points
 //  - [ ] fix bug with insufficient funds... have to sell extra tokens before creating LP
 //          this can be improved in the future by having own smart contract
@@ -9,9 +9,12 @@
 //  - [ ] Add tests
 use std::env;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+use chrono::Local;
+use env_logger::Builder;
+use log::{LevelFilter, info, warn, error, debug};
 use serde::{Deserialize, Serialize};
 use ethers::utils::{
     keccak256,
@@ -110,14 +113,12 @@ fn write_config(
     config: Config,
     config_file_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("");
-    println!("Writing config to file at {:?}", config_file_path);
+    info!("Writing config to file at {:?}", config_file_path);
 
     let config = serde_json::to_string_pretty(&config)?;
     std::fs::write(config_file_path, config)?;
 
-    println!("Wrote new LP position token ID to config file");
-    println!("");
+    info!("Wrote new LP position token ID to config file");
 
     Ok(())
 }
@@ -133,20 +134,20 @@ async fn send_tx_to_mempool(
     let client = provider.with_signer(signer);
 
     // send tx to mempool
-    println!("sending to mempool: {:?}", tx);
+    info!("sending to mempool: {:?}", tx);
     let pending_tx = client.send_transaction(tx.clone(), None).await?;
 
     // get the mined tx
     let receipt = pending_tx.await?.ok_or_else(|| eyre::format_err!("tx dropped from mempool"))?;
-    println!("Tx mined, hash: {:?}", receipt.transaction_hash);
-    println!("Receipt status: {:?}", receipt.status);
+    info!("Tx mined, hash: {:?}", receipt.transaction_hash);
+    info!("Receipt status: {:?}", receipt.status);
 
     // if tx failed, retry up to 2 times
     // increasing gas limit by 10% and gas price by 10% each time
     if receipt.status == Some(U64::from(0)) {
-        println!("Tx failed, retrying up to 2 times");
-        println!("Raising gas limit and gas price by 10% each time");
-        println!("");
+        info!("Tx failed, retrying up to 2 times");
+        info!("Raising gas limit and gas price by 10% each time");
+
         let mut tx = tx.clone();
         let mut gas_price = receipt.effective_gas_price.unwrap();
         let mut gas_limit = receipt.gas_used.unwrap();
@@ -154,18 +155,18 @@ async fn send_tx_to_mempool(
         gas_limit = gas_limit + gas_limit / 10;
         tx = tx.gas(gas_limit).gas_price(gas_price);
 
-        println!("sending to mempool: {:?}", tx);
+        info!("sending to mempool: {:?}", tx);
         let pending_tx = client.send_transaction(tx.clone(), None).await?;
         let receipt = pending_tx.await?.ok_or_else(|| eyre::format_err!("tx dropped from mempool"))?;
-        println!("Tx mined, hash: {:?}", receipt.transaction_hash);
-        println!("Receipt status: {:?}", receipt.status);
+        info!("Tx mined, hash: {:?}", receipt.transaction_hash);
+        info!("Receipt status: {:?}", receipt.status);
 
         if receipt.status == Some(U64::from(1)) {
             return Ok(receipt);
         } else {
-            println!("Tx failed, retrying 1 more time");
-            println!("Raising gas limit and gas price by 10% each");
-            println!("");
+            info!("Tx failed, retrying 1 more time");
+            info!("Raising gas limit and gas price by 10% each");
+
             let mut tx = tx.clone();
             let mut gas_price = receipt.effective_gas_price.unwrap();
             let mut gas_limit = receipt.gas_used.unwrap();
@@ -173,11 +174,11 @@ async fn send_tx_to_mempool(
             gas_limit = gas_limit + gas_limit / 10;
             tx = tx.gas(gas_limit).gas_price(gas_price);
 
-            println!("sending to mempool: {:?}", tx);
+            info!("sending to mempool: {:?}", tx);
             let pending_tx = client.send_transaction(tx, None).await?;
             let receipt = pending_tx.await?.ok_or_else(|| eyre::format_err!("tx dropped from mempool"))?;
-            println!("Tx mined, hash: {:?}", receipt.transaction_hash);
-            println!("Receipt status: {:?}", receipt.status);
+            info!("Tx mined, hash: {:?}", receipt.transaction_hash);
+            info!("Receipt status: {:?}", receipt.status);
 
             return Ok(receipt);
         }
@@ -329,7 +330,7 @@ async fn erc20_approve(
     }
 
     // call the contract method to approve the spender to spend the token
-    println!("Approving {spender} to spend {token_address} MAX U256");
+    info!("Approving {spender} to spend {token_address} MAX U256");
     let function_call = token.approve(
         spender.clone(),
         U256::MAX
@@ -360,29 +361,29 @@ async fn fetch_twap_tick(
         "./src/abis/UniswapV3Pool.json",
     );
     let uni_v3_pool_address = config.uni_v3_pool_address.parse::<EthersAddress>()?;
-    println!("got uni_v3_pool_address: {:?}", uni_v3_pool_address);
+    info!("got uni_v3_pool_address: {:?}", uni_v3_pool_address);
     let client = Arc::new(provider);
     let v3_pool = UniswapV3Pool::new(
         uni_v3_pool_address,
         client.clone()
     );
-    println!("got v3_pool {:?}", v3_pool);
+    info!("got v3_pool {:?}", v3_pool);
 
     // call the contract method to fetch price observations
     let input = vec!(
         seconds,
         u32::try_from(0).unwrap()
     );
-    println!("input: {:?}", input);
+    info!("input: {:?}", input);
     let observations = v3_pool.observe(input.into()).call().await?;
-    println!("got observations {:?}", observations);
+    info!("got observations {:?}", observations);
 
     // calculate the TWAP price as an arithmetic mean
     let tick_cumulatives = observations.0;
     let tick_cumulatives_delta = tick_cumulatives[1] - tick_cumulatives[0];
-    println!("{:?}", tick_cumulatives_delta);
+    info!("{:?}", tick_cumulatives_delta);
     let twap_tick = i32::try_from(tick_cumulatives_delta).unwrap() / i32::try_from(seconds).unwrap();
-    println!("{:?}", twap_tick);
+    info!("{:?}", twap_tick);
 
     Ok(())
 }
@@ -409,11 +410,11 @@ async fn get_size_in_weth(
         pool.token1.clone()
     );
     let price = price.unwrap();
-    println!(
+    info!(
         "price of WETH in USD: {:?}",
         price.to_significant(pool.token1.decimals, Rounding::RoundHalfUp).unwrap()
     );
-    println!("quote token size desired in USD: {:?}", config.quote_token_size_in_usd);
+    info!("quote token size desired in USD: {:?}", config.quote_token_size_in_usd);
 
     // calculate amount of WETH needed based on config.quote_token_size_in_usd
     let inverted = price.clone().invert();
@@ -440,7 +441,7 @@ async fn swap_token_for_token_given_amount_in(
     pool_fee: FeeAmount,
     amount_in: U256,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Swapping {:?} of {:?} for {:?}", amount_in, token_in, token_out);
+    info!("Swapping {:?} of {:?} for {:?}", amount_in, token_in, token_out);
 
     // make sure wallet has enough balance of token_in
     assert_balance(
@@ -473,7 +474,7 @@ async fn swap_token_for_token_given_amount_in(
     let range_ticks = calc_new_ticks(pool.tick_current, config.tick_data_provider_range);
     let lower_tick = nearest_usable_tick(range_ticks.0, pool.tick_spacing());
     let upper_tick = nearest_usable_tick(range_ticks.1, pool.tick_spacing());
-    println!("getting tick provider, lower_tick: {:?}, upper_tick: {:?}", lower_tick, upper_tick);
+    info!("getting tick provider, lower_tick: {:?}, upper_tick: {:?}", lower_tick, upper_tick);
     let tick_provider = EphemeralTickDataProvider::new(
         config.uni_v3_pool_address.clone().parse::<AlloyAddress>()?,
         Arc::new(provider.clone()),
@@ -497,9 +498,9 @@ async fn swap_token_for_token_given_amount_in(
         SystemTime::now() + Duration::from_secs(2 * 60)
     ).duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
     let slippage = convert_float_to_percent(config.swap_slippage_pct);
-    println!("Preparing swap tx");
-    println!("swap slippage: {:?}", slippage);
-    println!("");
+
+    info!("Preparing swap tx");
+    info!("swap slippage: {:?}", slippage);
 
     // configure swap options
     let options = SwapOptions {
@@ -547,10 +548,9 @@ async fn swap_token_for_token_given_amount_out(
     pool_fee: FeeAmount,
     amount_out: U256,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("");
-    println!("Swapping token for token for a specific amount out");
-    println!("token in: {:?}\ntoken out: {:?}\namount out: {:?}", token_in, token_out, amount_out);
-    println!("");
+    info!("Swapping token for token for a specific amount out");
+    info!("token in: {:?}\ntoken out: {:?}\namount out: {:?}", token_in, token_out, amount_out);
+
     let pool = get_pool(
         config.chain_id,
         config.uniswap_v3_factory_address.parse::<AlloyAddress>()?,
@@ -586,9 +586,8 @@ async fn swap_token_for_token_given_amount_out(
         SystemTime::now() + Duration::from_secs(2 * 60)
     ).duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
     let slippage = convert_float_to_percent(config.swap_slippage_pct);
-    println!("Preparing swap tx");
-    println!("swap slippage: {:?}", slippage);
-    println!("");
+    info!("Preparing swap tx");
+    info!("swap slippage: {:?}", slippage);
 
     // configure swap options
     let options = SwapOptions {
@@ -613,8 +612,8 @@ async fn swap_token_for_token_given_amount_out(
     let amount_in_as_str = amount_in.as_str();
     let amount_in_decimals = token_in.decimals as u32;
     let amount_in = parse_units(amount_in_as_str, amount_in_decimals).unwrap();
-    println!("amount in: {:?}", amount_in);
-    println!("amount out: {:?}", amount_out);
+    info!("amount in: {:?}", amount_in);
+    info!("amount out: {:?}", amount_out);
 
     // make sure wallet has enough balance of token_in
     assert_balance(
@@ -668,7 +667,7 @@ async fn buy_sell_token0_if_needed(
     // sell the extra token0
     if balance > token0_amount {
         let balance_diff = balance - token0_amount;
-        println!("Have more token0 than needed, selling extra token0 {:?}", balance_diff);
+        info!("Have more token0 than needed, selling extra token0 {:?}", balance_diff);
 
         swap_token_for_token_given_amount_in(
             provider.clone(),
@@ -683,7 +682,7 @@ async fn buy_sell_token0_if_needed(
     else if balance < token0_amount {
         // calculate the difference between balance and token1_amount
         let balance_diff = token0_amount - balance;
-        println!("Have less token0 than needed, buying needed token0 {:?}", balance_diff);
+        info!("Have less token0 than needed, buying needed token0 {:?}", balance_diff);
 
         swap_token_for_token_given_amount_out(
             provider.clone(),
@@ -696,7 +695,7 @@ async fn buy_sell_token0_if_needed(
     }
     // have just enough token0
     else {
-        println!("have just enough token1, no need to buy or sell token1");
+        info!("have just enough token1, no need to buy or sell token1");
     }
 
     Ok(())
@@ -718,7 +717,7 @@ async fn buy_sell_token1_if_needed(
     // sell the extra token1
     if balance > token1_amount {
         let balance_diff = balance - token1_amount;
-        println!("Have more token1 than needed, selling extra token1 {:?}", balance_diff);
+        info!("Have more token1 than needed, selling extra token1 {:?}", balance_diff);
 
         swap_token_for_token_given_amount_in(
             provider.clone(),
@@ -732,7 +731,7 @@ async fn buy_sell_token1_if_needed(
     // buy the needed token1
     else if balance < token1_amount {
         let balance_diff = token1_amount - balance;
-        println!("Have less token1 than needed, buying needed token1 {:?}", balance_diff);
+        info!("Have less token1 than needed, buying needed token1 {:?}", balance_diff);
 
         swap_token_for_token_given_amount_out(
             provider.clone(),
@@ -745,7 +744,7 @@ async fn buy_sell_token1_if_needed(
     }
     // have just enough token1
     else {
-        println!("have just enough token1, no need to buy or sell token1");
+        info!("have just enough token1, no need to buy or sell token1");
     }
 
     Ok(())
@@ -794,7 +793,7 @@ async fn create_lp_position(
     config: Config,
     config_file_path: &str
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Creating new liquidity position.");
+    info!("Creating new liquidity position.");
 
     // query v3 pool using address from config file
     let pool = fetch_pool(
@@ -803,17 +802,16 @@ async fn create_lp_position(
     ).await?;
 
     // get current price as a tick
-    println!("Current tick: {:?}", pool.tick_current);
+    info!("Current tick: {:?}", pool.tick_current);
 
     // calculate new upper and lower ticks
     let new_ticks = calc_new_ticks(pool.tick_current, config.range_percentage);
-    println!("Desired Ticks: {:?}", new_ticks);
+    info!("Desired Ticks: {:?}", new_ticks);
 
     // calculate amounts needed for new position
     let lower_tick = nearest_usable_tick(new_ticks.0, pool.tick_spacing());
     let upper_tick = nearest_usable_tick(new_ticks.1, pool.tick_spacing());
-    println!("Desired Usable Ticks: ({:?}, {:?})", lower_tick, upper_tick);
-    println!("");
+    info!("Desired Usable Ticks: ({:?}, {:?})", lower_tick, upper_tick);
 
     // get sqrt ratio at the ticks
     let sqrt_ratio_upper = get_sqrt_ratio_at_tick(upper_tick).unwrap();
@@ -864,10 +862,8 @@ async fn create_lp_position(
     let mint_amounts = position.clone().mint_amounts()?;
     let token0_amount = mint_amounts.amount0.to_ethers();
     let token1_amount = mint_amounts.amount1.to_ethers();
-    println!("");
-    println!("token0 amount: {:?}", token0_amount);
-    println!("token1 amount: {:?}", token1_amount);
-    println!("");
+    info!("token0 amount: {:?}", token0_amount);
+    info!("token1 amount: {:?}", token1_amount);
 
     // if token0 is quote token, buy/sell token1 as needed
     if pool.token0.address == config.weth_address.parse::<AlloyAddress>()? ||
@@ -928,10 +924,9 @@ async fn create_lp_position(
         SystemTime::now() + Duration::from_secs(2 * 60)
     ).duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
     let slippage = convert_float_to_percent(config.add_liq_slippage_pct);
-    println!("");
-    println!("Preparing liquidity add tx");
-    println!("Allowed slippage: {:?}", slippage);
-    println!("");
+
+    info!("Preparing liquidity add tx");
+    info!("Allowed slippage: {:?}", slippage);
 
     // configure add liquidity options
     let options = AddLiquidityOptions {
@@ -962,7 +957,7 @@ async fn create_lp_position(
         .data(method_params.calldata);
 
     // send tx to mempool
-    println!("Adding liquidity.");
+    info!("Adding liquidity.");
     let receipt = send_tx_to_mempool(
         provider.clone(),
         config.clone(),
@@ -971,7 +966,7 @@ async fn create_lp_position(
 
     // get token ID from logs in tx receipt
     let token_id = extract_token_id_from_logs(receipt.logs)?;
-    println!("New LP token ID: {:?}", token_id);
+    info!("New LP token ID: {:?}", token_id);
 
     // update config file with new LP token ID
     let mut config = config.clone();
@@ -986,7 +981,7 @@ async fn remove_liquidity_collect_fees(
     config: Config,
     config_file_path: &str
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Removing liquidity.");
+    info!("Removing liquidity.");
 
     // get position using token id
     let position = get_position(
@@ -999,7 +994,7 @@ async fn remove_liquidity_collect_fees(
 
     // check if position is empty
     if position.liquidity == 0 {
-        println!("There is no liquidity in the position, has it been removed already?");
+        info!("There is no liquidity in the position, has it been removed already?");
         return Ok(());
     }
 
@@ -1111,27 +1106,44 @@ async fn adjust_higher(
 }
 
 fn print_lp_position_details(lp_position: &Position<NoTickDataProvider>) {
-    println!("LP Position");
-    println!("-----------");
-    println!(
-        "Symbol:\t\t\t{:?}/{:?}",
+    info!(
+        "\nLP Position \n\
+        -------------\n\
+        Symbol:\t\t\t{:?}/{:?} \n\
+        Lower Tick:\t\t{:?} \n\
+        Upper Tick:\t\t{:?} \n\
+        Current Tick:\t\t{:?} \n\
+        Our Liquidity:\t\t{:?} \n\
+        Pool Liquidity:\t\t{:?} \n\
+        TODO: calculate total liquidity in the range instead of entire pool.\n",
         lp_position.pool.token1.symbol.clone().unwrap(),
-        lp_position.pool.token0.symbol.clone().unwrap()
+        lp_position.pool.token0.symbol.clone().unwrap(),
+        lp_position.tick_lower,
+        lp_position.tick_upper,
+        lp_position.pool.tick_current,
+        lp_position.liquidity,
+        lp_position.pool.liquidity
     );
-    println!("Lower Tick:\t\t{:?}", lp_position.tick_lower);
-    println!("Upper Tick:\t\t{:?}", lp_position.tick_upper);
-    println!("Current Tick:\t\t{:?}", lp_position.pool.tick_current);
-    println!("Our Liquidity:\t\t{:?}", lp_position.liquidity);
-    println!("Pool Liquidity:\t\t{:?}", lp_position.pool.liquidity);
-    println!("TODO: calculate total liquidity in the range instead of entire pool.");
-    println!("");
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // configure logging
+    Builder::new()
+    .format(|buf, record| {
+        writeln!(buf,
+            "{} [{}]: {}",
+            Local::now().format("%Y-%m-%dT%H:%M:%S"),
+            record.level(),
+            record.args()
+        )
+    })
+    .filter(None, LevelFilter::Info)
+    .init();
+
     // Get path to config file from command-line arguments
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
-        eprintln!("Usage: {} <config-file-path>", args[0]);
+        error!("Usage: {} <config-file-path>", args[0]);
         std::process::exit(1);
     }
     let config_file_path = &args[1];
@@ -1156,8 +1168,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap()
         .block_on(async {
             let block_number = provider.get_block_number().await.unwrap();
-            println!("Block Number: {block_number}");
-            println!("");
+            info!("Block Number: {block_number}");
 
             loop {
                 // reload config file
@@ -1166,7 +1177,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // if my_lp_position_id is 0, then create a new LP position
                 // and save the ID to the config file
                 if config.my_lp_position_id == 0 {
-                    println!("no LP position ID found in config file, creating new LP position");
+                    info!("no LP position ID found in config file, creating new LP position");
                     create_lp_position(
                         provider.clone(),
                         config.clone(),
@@ -1191,8 +1202,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // and adjust the position as necessary
                 let current_tick = lp_position.pool.tick_current.clone();
                 if current_tick < lp_position.tick_lower {
-                    println!("current tick is lower than our LP price range, adjusting lower.");
-                    println!("");
+                    info!("current tick is lower than our LP price range, adjusting lower.");
                     adjust_lower(
                         provider.clone(),
                         config.clone(),
@@ -1200,8 +1210,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ).await.unwrap();
                 }
                 else if current_tick > lp_position.tick_upper {
-                    println!("current tick is higher than our LP price range, adjusting higher.");
-                    println!("");
+                    info!("current tick is higher than our LP price range, adjusting higher.");
                     adjust_higher(
                         provider.clone(),
                         config.clone(),
@@ -1209,12 +1218,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ).await.unwrap();
                 }
                 else {
-                    println!("current tick is within our LP price range");
+                    info!("current tick is within our LP price range");
                 }
 
                 // wait 5 minutes
-                println!("waiting for {} seconds", config.seconds_to_wait);
-                println!("");
+                info!("waiting for {} seconds", config.seconds_to_wait);
                 std::thread::sleep(Duration::from_secs(config.seconds_to_wait as u64));
             }
         });
