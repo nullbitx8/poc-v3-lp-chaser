@@ -1,8 +1,11 @@
 // TODO
+//  - [ ] fix bot to buy/sell using universal router
+//  - [ ] fix bot to provide liquidity in the V3 pool using current tick of most liquid pool
+//          the most liquid pool could be a v2 pool... we can input this manually at first
 //  - [ ] calculate liquidity in range of ticks
+//  -       compare the expected profit between the 1% fee pool and the 0.3% fee pool
+//          based on how much liquidity is in the range of ticks for the different pools
 //  - [ ] collect data on fees collected as well as other data points
-//  - [ ] fix bug with insufficient funds... have to sell extra tokens before creating LP
-//          this can be improved in the future by having own smart contract
 //  - [ ] replace convert_to_ethers_u256 with to_ethers()
 //  - [ ] Make Config global
 //  - [ ] Make Provider global, and a signer
